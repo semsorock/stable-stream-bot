@@ -24,45 +24,30 @@ client = tweepy.Client(
 POLICY_ID = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad"
 
 # sample body request
+# https://blockfrost.dev/start-building/webhooks/webhooks-events#block
 # {
-#   "id": "a11c6d90-7bd5-4c0d-9aba-eb4ea3cafd5b",
-#   "webhook_id": "c87b86d9-696f-475b-b5ee-3fa5c80e9639",
-#   "created": 1741604600,
+#   "id": "47668401-c3a4-42d4-bac1-ad46515924a3",
+#   "webhook_id": "cf68eb9c-635f-415e-a5a8-6233638f28d7",
+#   "created": 1650013856,
 #   "api_version": 1,
-#   "type": "transaction",
-#   "payload": [
-#     {
-#       "tx": {
-#         "hash": "de307385c92aaab8fbd9d3862c03684f90646876a126b2c6d08805c8745de85c",
-#         "block": "756bcc96673889de2a013d59962cb4b30ed321a2090c616f976382c40260bedb",
-#         "block_height": 11584723,
-#         "block_time": 1741604523,
-#         "slot": 150038232,
-#         "index": 3,
-#         "output_amount": [],
-#         "fees": "529003",
-#         "deposit": "0",
-#         "size": 1383,
-#         "invalid_before": "150038217",
-#         "invalid_hereafter": "150039217",
-#         "utxo_count": 6,
-#         "withdrawal_count": 1,
-#         "mir_cert_count": 0,
-#         "delegation_count": 0,
-#         "stake_cert_count": 0,
-#         "pool_update_count": 0,
-#         "pool_retire_count": 0,
-#         "asset_mint_or_burn_count": 1,
-#         "redeemer_count": 4,
-#         "valid_contract": true
-#       },
-#       "inputs": [
-
-#       ],
-#       "outputs": [
-#       ]
-#     }
-#   ]
+#   "type": "block",
+#   "payload": {
+#     "time": 1650013853,
+#     "height": 7126256,
+#     "hash": "f49521b67b440e5030adf124aee8f88881b7682ba07acf06c2781405b0f806a4",
+#     "slot": 58447562,
+#     "epoch": 332,
+#     "epoch_slot": 386762,
+#     "slot_leader": "pool1njjr0zn7uvydjy8067nprgwlyxqnznp9wgllfnag24nycgkda25",
+#     "size": 34617,
+#     "tx_count": 13,
+#     "output": "13403118309871",
+#     "fees": "4986390",
+#     "block_vrf": "vrf_vk197w95j9alkwt8l4g7xkccknhn4pqwx65c5saxnn5ej3cpmps72msgpw69d",
+#     "previous_block": "9e3f5bfc9f0be44cf6e14db9ed5f1efb6b637baff0ea1740bb6711786c724915",
+#     "next_block": null,
+#     "confirmations": 0
+#   }
 # }
 
 
@@ -71,17 +56,19 @@ def format_pretty_string(number):
     return formatted_number
 
 
-GET_MINT = """
-    SELECT mtm.quantity FROM ma_tx_mint AS mtm
+GET_MINTS = """
+    SELECT encode(tx.hash, 'hex'), mtm.quantity
+      FROM ma_tx_mint AS mtm
       JOIN multi_asset AS ma ON mtm.ident = ma.id 
-      JOIN tx on tx.id = mtm.tx_id
-     WHERE ma.fingerprint = 'asset12ffdj8kk2w485sr7a5ekmjjdyecz8ps2cm5zed'
-       AND encode(tx.hash::bytea, 'hex') = %s"""
+      JOIN tx ON tx.id = mtm.tx_id
+      JOIN block ON block.id = tx.block_id
+     WHERE encode(ma.policy, 'hex') = %s
+       AND encode(block.hash, 'hex') = %s"""
 
 GET_SUPPLY = """
     SELECT sum(mtm.quantity) FROM ma_tx_mint AS mtm 
       JOIN multi_asset AS ma ON mtm.ident = ma.id 
-     WHERE ma.fingerprint = 'asset12ffdj8kk2w485sr7a5ekmjjdyecz8ps2cm5zed'"""
+     WHERE encode(ma.policy, 'hex') = %s"""
 
 
 def get_one(conn, query, params: tuple = None):
@@ -98,41 +85,34 @@ def get_one(conn, query, params: tuple = None):
     return result
 
 
-def process_transaction(conn, tx_hash):
-    mint = get_one(conn, GET_MINT, (tx_hash,))
-    logging.info(f"mint: {mint}")
+def process_transaction(tx_hash, mint, supply):
+    logging.info(f"tx_hash: {tx_hash}, mint: {mint}, supply: {supply}")
 
-    if mint is not None:
-        supply = get_one(conn, GET_SUPPLY)
-        logging.info(f"supply: {supply}")
+    action = ""
+    pretty_quantity = format_pretty_string(mint / 1_000_000)
 
-        action = ""
-        pretty_quantity = format_pretty_string(mint / 1_000_000)
+    if mint > 0:
+        action = "MINTED"
+        pretty_quantity = "+" + pretty_quantity
+    elif mint < 0:
+        action = "BURNED"
 
-        if mint > 0:
-            action = "MINTED"
-            pretty_quantity = "+" + pretty_quantity
-        elif mint < 0:
-            action = "BURNED"
+    pretty_supply = format_pretty_string(supply / 1_000_000)
 
-        pretty_supply = format_pretty_string(supply / 1_000_000)
+    tweet_text = "\n".join(
+        [
+            f"$USDM has been {action}!",
+            f"quantity: {pretty_quantity}",
+            f"total supply: {pretty_supply}",
+            f"https://cardanoscan.io/transaction/{tx_hash}?tab=tokenmint\n",
+            f"#cardano #blockchain #stablecoin",
+        ]
+    )
 
-        tweet_text = "\n".join(
-            [
-                f"$USDM has been {action}!",
-                f"quantity: {pretty_quantity}",
-                f"total supply: {pretty_supply}",
-                f"https://cexplorer.io/tx/{tx_hash}/mint#data\n",
-                f"#cardano #blockchain #stablecoin",
-            ]
-        )
+    logging.info(tweet_text)
 
-        logging.info(tweet_text)
-
-        response = client.create_tweet(text=tweet_text)
-        logging.info(f"Response: {response}")
-    else:
-        logging.info(f"Skipping. Policy there is no USDM mint in tx: {tx_hash}")
+    response = client.create_tweet(text=tweet_text)
+    logging.info(f"Response: {response}")
 
 
 @functions_framework.http
@@ -153,9 +133,30 @@ def hello_http(request):
 
     conn = psycopg2.connect(DB_SYNC_URL)
     try:
-        for item in request_json.get("payload", []):
-            tx_hash = item.get("tx", {}).get("hash")
-            process_transaction(conn, tx_hash)
+        # Get total supply once per webhook call
+        supply = get_one(conn, GET_SUPPLY, (POLICY_ID,))
+        logging.info(f"Current total supply: {supply}")
+
+        # Expecting payload type 'block'
+        # Webhook documentation: https://blockfrost.dev/start-building/webhooks/webhooks-events#block
+        payload = request_json.get("payload", {})
+        block_hash = payload.get("hash")
+
+        if block_hash:
+            logging.info(f"Processing block: {block_hash}")
+
+            # Query all relevant mints from that block at once
+            cur = conn.cursor()
+            cur.execute(GET_MINTS, (POLICY_ID, block_hash))
+            rows = cur.fetchall()
+            cur.close()
+
+            logging.info(f"Found {len(rows)} relevant mints in block {block_hash}")
+
+            for tx_hash, mint in rows:
+                process_transaction(tx_hash, mint, supply)
+        else:
+            logging.warning("No block hash found in payload")
 
     except Exception as e:
         logging.error(f"Error processing request: {e}")
