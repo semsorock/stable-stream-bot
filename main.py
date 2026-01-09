@@ -20,6 +20,18 @@ client = tweepy.Client(
     access_token_secret=ACCESS_TOKEN_SECRET,
 )
 
+# Global database connection
+db_conn = None
+
+
+def get_db_connection():
+    global db_conn
+    if db_conn is None or db_conn.closed != 0:
+        logging.info("Opening new database connection")
+        db_conn = psycopg2.connect(DB_SYNC_URL)
+    return db_conn
+
+
 # https://cexplorer.io/policy/c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad
 POLICY_ID = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad"
 
@@ -131,8 +143,8 @@ def hello_http(request):
 
     logging.info(f"request_json: {request_json}")
 
-    conn = psycopg2.connect(DB_SYNC_URL)
     try:
+        conn = get_db_connection()
         # Get total supply once per webhook call
         supply = get_one(conn, GET_SUPPLY, (POLICY_ID,))
         logging.info(f"Current total supply: {supply}")
@@ -160,7 +172,10 @@ def hello_http(request):
 
     except Exception as e:
         logging.error(f"Error processing request: {e}")
-    finally:
-        conn.close()
+        # If there's a psycopg2 Error, we might want to clear the global connection
+        if isinstance(e, psycopg2.Error):
+            global db_conn
+            db_conn = None
+
 
     return f"Received POST data: {request_json}".encode("utf-8")
