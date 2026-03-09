@@ -1,28 +1,30 @@
 """XDK wrapper for posting tweets with feature flag gate."""
 
-from xdk import XClient
-from xdk.auth import OAuth1UserAuth
+from xdk import Client
+from xdk.oauth1_auth import OAuth1
+from xdk.posts.models import CreateRequest
 
 from ..config import get_config
 from ..logging import get_logger
 
 logger = get_logger(__name__)
 
-_client: XClient | None = None
+_client: Client | None = None
 
 
-def _get_client() -> XClient:
+def _get_client() -> Client:
     """Get or create the XDK client."""
     global _client
     if _client is None:
         config = get_config()
-        auth = OAuth1UserAuth(
-            consumer_key=config.api_key,
-            consumer_secret=config.api_secret_key,
+        oauth1 = OAuth1(
+            api_key=config.api_key,
+            api_secret=config.api_secret_key,
+            callback="oob",
             access_token=config.access_token,
             access_token_secret=config.access_token_secret,
         )
-        _client = XClient(auth=auth)
+        _client = Client(auth=oauth1)
     return _client
 
 
@@ -60,7 +62,7 @@ def post_tweet(text: str) -> str | None:
 
     try:
         client = _get_client()
-        response = client.posts.create(text=text)
+        response = client.posts.create(CreateRequest(text=text))
         tweet_id = _extract_post_id(response)
         logger.info(f"Tweet posted successfully: {tweet_id}")
         return tweet_id

@@ -14,15 +14,29 @@ logger = get_logger(__name__)
 # Shared connection state
 _conn: psycopg.AsyncConnection | None = None
 _conn_lock = asyncio.Lock()
+_effective_db_url: str | None = None
+
+
+def set_db_url(url: str) -> None:
+    """Override the DB connection URL (e.g. after SSH tunnel setup)."""
+    global _effective_db_url
+    _effective_db_url = url
+
+
+def _get_db_url() -> str:
+    """Get the effective database URL."""
+    if _effective_db_url is not None:
+        return _effective_db_url
+    return get_config().db_sync_url
 
 
 async def _get_connection() -> psycopg.AsyncConnection:
     """Get or create the shared database connection."""
     global _conn
     if _conn is None or _conn.closed:
-        config = get_config()
+        url = _get_db_url()
         logger.info("Opening new database connection")
-        _conn = await psycopg.AsyncConnection.connect(config.db_sync_url, autocommit=True)
+        _conn = await psycopg.AsyncConnection.connect(url, autocommit=True)
     return _conn
 
 

@@ -1,11 +1,12 @@
 """FastAPI app and async webhook handler."""
 
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import FastAPI, HTTPException, Request
 
 from .config import get_config
-from .db.repository import close_connection, get_mints_for_block, get_total_supply
+from .db.repository import close_connection, get_mints_for_block, get_total_supply, set_db_url
 from .db.ssh_tunnel import SSHTunnel, create_tunnel_if_configured
 from .logging import get_logger, setup_logging
 from .twitter.client import post_tweet
@@ -17,6 +18,17 @@ logger = get_logger(__name__)
 
 # SSH tunnel instance (if configured)
 _ssh_tunnel: SSHTunnel | None = None
+
+
+def _get_tunneled_url(original_url: str, local_port: int) -> str:
+    """Rewrite db_sync_url to route through the local tunnel port."""
+    parsed = urlparse(original_url)
+    local = f"127.0.0.1:{local_port}"
+    if parsed.password:
+        netloc = f"{parsed.username}:{parsed.password}@{local}"
+    else:
+        netloc = f"{parsed.username}@{local}"
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 @asynccontextmanager
@@ -33,16 +45,10 @@ async def lifespan(app: FastAPI):
         local_port = _ssh_tunnel.start()
         logger.info(f"SSH tunnel started on port {local_port}")
 
-        # Update DB_SYNC_URL to use local tunnel
-        # This is a workaround - in production, use environment variable substitution
-        import os
-        import urllib.parse
-
+        # Update DB URL to use local tunnel
         config = get_config()
-        parsed = urllib.parse.urlparse(config.db_sync_url)
-        # Reconstruct URL with localhost and tunnel port
-        new_url = parsed._replace(netloc=f"{parsed.username}:{parsed.password}@localhost:{local_port}")
-        os.environ["DB_SYNC_URL"] = urllib.parse.urlunparse(new_url)
+        tunneled_url = _get_tunneled_url(config.db_sync_url, local_port)
+        set_db_url(tunneled_url)
 
     yield
 
