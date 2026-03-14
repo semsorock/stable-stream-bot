@@ -1,5 +1,7 @@
 """FastAPI app and async webhook handler."""
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, urlunparse
 
@@ -54,10 +56,11 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down USDM Stream Bot")
-    await close_connection()
 
     if _ssh_tunnel:
         _ssh_tunnel.stop()
+
+    await close_connection()
 
 
 app = FastAPI(title="USDM Stream Bot", lifespan=lifespan)
@@ -88,8 +91,8 @@ async def webhook(request: Request):
 
     # Parse JSON payload
     try:
-        payload = await request.json()
-    except Exception as e:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
@@ -103,15 +106,11 @@ async def webhook(request: Request):
         logger.warning("No block hash in payload")
         return {"status": "skipped", "reason": "no block hash"}
 
-    # Process the block
-    try:
-        await _process_block(block_hash)
-    except Exception as e:
-        logger.error(f"Error processing block {block_hash}: {e}")
-        # Return 200 to acknowledge receipt - Blockfrost will retry on 5xx
-        return {"status": "error", "message": str(e)}
+    logger.info(f"Accepted block {block_hash} for background processing")
+    task = asyncio.create_task(_process_block(block_hash), name=f"process-block-{block_hash[:12]}")
+    task.add_done_callback(_log_background_task_result)
 
-    return {"status": "processed", "block_hash": block_hash}
+    return {"status": "accepted", "block_hash": block_hash}
 
 
 async def _process_block(block_hash: str) -> None:
@@ -137,9 +136,17 @@ async def _process_block(block_hash: str) -> None:
 
         # Format and post tweet
         tweet_text = format_event_tweet(event, supply)
-        tweet_id = post_tweet(tweet_text)
+        tweet_id = await asyncio.to_thread(post_tweet, tweet_text)
 
         if tweet_id:
             logger.info(f"Posted tweet {tweet_id} for tx {event.tx_hash}")
         else:
             logger.info(f"Tweet not posted for tx {event.tx_hash}")
+
+
+def _log_background_task_result(task: asyncio.Task[None]) -> None:
+    """Log background task failures so they are not silently dropped."""
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Background block processing failed")

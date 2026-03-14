@@ -30,10 +30,6 @@ class Config:
     # Feature flags
     tweet_posting_enabled: bool
 
-    # Firestore
-    firestore_project_id: str | None
-    firestore_database: str
-
     # SSH tunnel (optional)
     ssh_host: str | None
     ssh_port: int
@@ -71,8 +67,6 @@ def get_config() -> Config:
         db_sync_url=_get_required("DB_SYNC_URL"),
         blockfrost_webhook_auth_token=_get_optional("BLOCKFROST_WEBHOOK_AUTH_TOKEN"),
         tweet_posting_enabled=_get_bool("TWEET_POSTING_ENABLED", default=False),
-        firestore_project_id=_get_optional("FIRESTORE_PROJECT_ID"),
-        firestore_database=_get_optional("FIRESTORE_DATABASE", "(default)") or "(default)",
         ssh_host=_get_optional("SSH_HOST"),
         ssh_port=_get_int("SSH_PORT", 22),
         ssh_user=_get_optional("SSH_USER"),
