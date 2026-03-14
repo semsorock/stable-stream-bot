@@ -66,6 +66,6 @@ def post_tweet(text: str) -> str | None:
         tweet_id = _extract_post_id(response)
         logger.info(f"Tweet posted successfully: {tweet_id}")
         return tweet_id
-    except Exception as e:
-        logger.error(f"Failed to post tweet: {e}")
-        return None
+    except Exception:
+        logger.exception("Failed to post tweet")
+        raise

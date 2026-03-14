@@ -12,7 +12,6 @@ dependencies = [
     "psycopg[binary]>=3,<4",
     "tenacity>=9,<10",
     "python-dotenv>=1.2.1",
-    "google-cloud-firestore>=2.20,<3",
     "xdk>=0.8.1",
     "paramiko>=3",
 ]

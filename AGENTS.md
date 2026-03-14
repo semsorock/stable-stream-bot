@@ -11,9 +11,9 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 ### Core Data Flow
 
 1. **Blockfrost webhook** → Cloud Run `/` endpoint
-2. **Query Cardano DB-Sync** (PostgreSQL) for USDM mint/burn transactions
-3. **Post tweets** via X API (XDK) with quantity, supply, and Cardanoscan link
-4. **Persist runtime state** to Firestore (posted tx hashes, checkpoints)
+2. **Acknowledge the webhook quickly** to keep request latency low
+3. **Query Cardano DB-Sync** (PostgreSQL) in background for USDM mint/burn transactions
+4. **Post tweets** via X API (XDK) with quantity, supply, and Cardanoscan link
 
 ### Project Structure
 
@@ -25,9 +25,8 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 │   ├── logging.py               # Logging setup (setup_logging, get_logger)
 │   ├── models.py                # Dataclasses: MintEvent
 │   ├── links.py                 # External link builders (Cardanoscan)
-│   ├── main.py                  # FastAPI app + async webhook handler
+│   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── webhook_auth.py          # Blockfrost HMAC-SHA256 signature verification
-│   ├── state_store.py           # Firestore-backed runtime state helpers
 │   ├── db/
 │   │   ├── __init__.py
 │   │   ├── queries.py           # SQL query constants
@@ -72,9 +71,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 - `bot/links.py`: URL builders for Cardanoscan.
 
-- `bot/main.py`: FastAPI `app` instance with async `POST /` webhook handler.
-
-- `bot/state_store.py`: Firestore-backed persistence for posted transaction hashes.
+- `bot/main.py`: FastAPI `app` instance with a fast-ack `POST /` webhook handler that continues block processing asynchronously in-process.
 
 - `bot/logging.py`: `setup_logging()` + `get_logger()` — stdlib logging, structured for Cloud Run.
 
@@ -132,10 +129,6 @@ BLOCKFROST_WEBHOOK_AUTH_TOKEN      # Blockfrost webhook HMAC secret
 API_KEY, API_SECRET_KEY            # Twitter OAuth 1.0a
 ACCESS_TOKEN, ACCESS_TOKEN_SECRET  # Twitter access credentials
 TWEET_POSTING_ENABLED              # "true" to enable tweet posting (default: false)
-
-# Firestore runtime state (optional override, uses ADC project by default)
-FIRESTORE_PROJECT_ID               # optional GCP project override
-FIRESTORE_DATABASE                 # Firestore DB id (default: (default))
 
 # SSH tunnel (optional — for accessing DB through bastion host)
 SSH_HOST                           # Bastion host address
@@ -258,8 +251,6 @@ psycopg[binary]>=3,<4       # Async PostgreSQL adapter (psycopg v3)
 tenacity>=9,<10             # Retry/backoff decorator
 python-dotenv>=1.2.1        # .env file loading
 paramiko>=3                 # SSH tunnel for bastion-host DB access
-google-cloud-firestore>=2.20,<3  # Firestore state store client
-
 # Dev
 pytest>=8                   # Test runner
 pytest-asyncio>=0.25        # Async test support (asyncio_mode = "auto")

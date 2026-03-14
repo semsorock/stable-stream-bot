@@ -5,13 +5,13 @@ A monitoring bot that watches the Cardano blockchain for USDM stablecoin mint/bu
 ## How It Works
 
 ```
-Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Query DB-Sync (async) → Post to X
+Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Background DB-Sync query → Post to X
 ```
 
 1. **Blockfrost** sends block webhooks to `/`
-2. The bot queries a **Cardano DB-Sync** PostgreSQL database for USDM mint/burn events
-3. Formatted summaries are posted to **Twitter/X** via `xdk`
-4. Mutable runtime state (posted tx hashes) is stored in **Google Cloud Firestore**
+2. The bot acknowledges the webhook quickly to keep request latency low
+3. Background processing queries a **Cardano DB-Sync** PostgreSQL database for USDM mint/burn events
+4. Formatted summaries are posted to **Twitter/X** via `xdk`
 
 ### What It Monitors
 
@@ -38,8 +38,6 @@ The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run 
 | `DB_SYNC_URL` | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/dbname`) |
 | `BLOCKFROST_WEBHOOK_AUTH_TOKEN` | Shared secret used to verify `Blockfrost-Signature` |
 | `TWEET_POSTING_ENABLED` | Set to `true` to enable posting tweets (default: `false`) |
-| `FIRESTORE_PROJECT_ID` | Optional Firestore project override; default uses ADC project |
-| `FIRESTORE_DATABASE` | Firestore database ID (default: `(default)`) |
 | `SSH_HOST` | Optional bastion host for SSH tunnel to DB |
 | `SSH_PORT` | SSH port (default: `22`) |
 | `SSH_USER` | SSH username for tunnel |
@@ -93,6 +91,8 @@ docker run --rm -p 8080:8080 \
 
 The bot is deployed to **Google Cloud Run** with continuous deployment from this GitHub repository.
 
+`POST /` returns an accepted response immediately and continues block processing asynchronously inside the app process. This reduces webhook backpressure, but it is still an in-process handoff rather than an external durable queue.
+
 ### One-Time Setup
 
 1. **Store secrets** in Google Secret Manager for your GCP project:
@@ -125,10 +125,9 @@ Every push to the `main` branch automatically triggers:
 │   ├── config.py                # Centralised env config + feature flags
 │   ├── links.py                 # External link builders (Cardanoscan)
 │   ├── logging.py               # Structured logging setup
-│   ├── main.py                  # FastAPI app + async webhook handler
+│   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── models.py                # Domain dataclasses
 │   ├── webhook_auth.py          # Blockfrost HMAC signature verification
-│   ├── state_store.py           # Firestore-backed runtime state
 │   ├── db/                      # SQL constants + async repository layer + SSH tunnel
 │   └── twitter/
 │       ├── client.py            # XDK posting client
