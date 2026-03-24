@@ -105,10 +105,11 @@ async def webhook(request: Request):
     block_data = payload.get("payload", {})
     block_hash = block_data.get("hash") if isinstance(block_data, dict) else None
 
-    if block_hash is None and isinstance(block_data, dict):
-        logger.debug(f"Payload 'payload' keys: {list(block_data.keys())}")
-
     if not block_hash:
+        if isinstance(block_data, dict):
+            logger.debug(f"Payload 'payload' keys: {list(block_data.keys())}")
+        else:
+            logger.debug(f"Payload 'payload' is not a dict: {type(block_data).__name__}")
         logger.warning("No block hash in payload")
         return {"status": "skipped", "reason": "no block hash"}
 
