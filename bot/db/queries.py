@@ -18,3 +18,10 @@ SELECT COALESCE(SUM(mtm.quantity), 0)
   JOIN multi_asset AS ma ON mtm.ident = ma.id
  WHERE encode(ma.policy, 'hex') = %s
 """
+
+# Check whether a block has been indexed by DB-Sync
+QUERY_BLOCK_EXISTS = """
+SELECT EXISTS (
+  SELECT 1 FROM block WHERE encode(hash, 'hex') = %s
+)
+"""

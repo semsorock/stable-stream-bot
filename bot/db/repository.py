@@ -7,7 +7,7 @@ import psycopg
 from ..config import USDM_POLICY_ID, get_config
 from ..logging import get_logger
 from ..models import MintEvent
-from .queries import QUERY_MINTS, QUERY_SUPPLY
+from .queries import QUERY_BLOCK_EXISTS, QUERY_MINTS, QUERY_SUPPLY
 
 logger = get_logger(__name__)
 
@@ -63,14 +63,26 @@ async def _query(sql: str, params: tuple) -> list[tuple]:
 
 async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
     """Get all USDM mint/burn events for a block."""
+    logger.debug(f"Querying mints for block_hash={block_hash}, policy_id={USDM_POLICY_ID}")
     rows = await _query(QUERY_MINTS, (USDM_POLICY_ID, block_hash))
+    logger.debug(f"Query returned {len(rows)} row(s) for block {block_hash}")
     return [MintEvent(tx_hash=row[0], quantity=row[1]) for row in rows]
 
 
 async def get_total_supply() -> int:
     """Get the current total USDM supply in base units."""
     rows = await _query(QUERY_SUPPLY, (USDM_POLICY_ID,))
-    return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+    supply = int(rows[0][0]) if rows and rows[0][0] is not None else 0
+    logger.debug(f"Total supply query returned: {supply}")
+    return supply
+
+
+async def block_exists(block_hash: str) -> bool:
+    """Check whether DB-Sync has indexed a given block."""
+    rows = await _query(QUERY_BLOCK_EXISTS, (block_hash,))
+    exists = bool(rows and rows[0][0])
+    logger.debug(f"Block {block_hash} exists in DB-Sync: {exists}")
+    return exists
 
 
 async def close_connection() -> None:

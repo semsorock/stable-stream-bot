@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse, urlunparse
 
 from fastapi import FastAPI, HTTPException, Request
+from tenacity import retry, retry_if_result, stop_after_attempt, wait_exponential
 
 from .config import get_config
-from .db.repository import close_connection, get_mints_for_block, get_total_supply, set_db_url
+from .db.repository import block_exists, close_connection, get_mints_for_block, get_total_supply, set_db_url
 from .db.ssh_tunnel import SSHTunnel, create_tunnel_if_configured
 from .logging import get_logger, setup_logging
 from .twitter.client import post_tweet
@@ -96,11 +97,16 @@ async def webhook(request: Request):
         logger.error(f"Failed to parse JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.info(f"Received webhook: {payload.get('type', 'unknown')}")
+    webhook_type = payload.get("type", "unknown")
+    logger.info(f"Received webhook: {webhook_type}")
+    logger.debug(f"Webhook payload keys: {list(payload.keys())}")
 
     # Extract block hash from payload
     block_data = payload.get("payload", {})
-    block_hash = block_data.get("hash")
+    block_hash = block_data.get("hash") if isinstance(block_data, dict) else None
+
+    if block_hash is None and isinstance(block_data, dict):
+        logger.debug(f"Payload 'payload' keys: {list(block_data.keys())}")
 
     if not block_hash:
         logger.warning("No block hash in payload")
@@ -113,9 +119,33 @@ async def webhook(request: Request):
     return {"status": "accepted", "block_hash": block_hash}
 
 
+@retry(
+    retry=retry_if_result(lambda exists: not exists),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+)
+async def _wait_for_block_indexed(block_hash: str) -> bool:
+    """Wait until DB-Sync has indexed the block (handles indexing lag)."""
+    exists = await block_exists(block_hash)
+    if not exists:
+        logger.info(f"Block {block_hash} not yet indexed in DB-Sync, retrying...")
+    return exists
+
+
 async def _process_block(block_hash: str) -> None:
     """Process a block for USDM mint/burn events."""
     logger.info(f"Processing block: {block_hash}")
+
+    # Wait for DB-Sync to index the block (handles indexing lag)
+    try:
+        indexed = await _wait_for_block_indexed(block_hash)
+    except Exception:
+        logger.exception(f"Failed waiting for block {block_hash} to be indexed")
+        raise
+
+    if not indexed:
+        logger.warning(f"Block {block_hash} not found in DB-Sync after retries")
+        return
 
     # Get all mint/burn events for this block
     events = await get_mints_for_block(block_hash)
@@ -130,18 +160,23 @@ async def _process_block(block_hash: str) -> None:
     supply = await get_total_supply()
     logger.info(f"Current total supply: {supply}")
 
-    # Process each event
+    # Process each event independently so one failure doesn't skip the rest
     for event in events:
-        logger.info(f"Processing event: tx={event.tx_hash}, quantity={event.quantity}")
+        try:
+            logger.info(f"Processing event: tx={event.tx_hash}, quantity={event.quantity}")
 
-        # Format and post tweet
-        tweet_text = format_event_tweet(event, supply)
-        tweet_id = await asyncio.to_thread(post_tweet, tweet_text)
+            # Format and post tweet
+            tweet_text = format_event_tweet(event, supply)
+            tweet_id = await asyncio.to_thread(post_tweet, tweet_text)
 
-        if tweet_id:
-            logger.info(f"Posted tweet {tweet_id} for tx {event.tx_hash}")
-        else:
-            logger.info(f"Tweet not posted for tx {event.tx_hash}")
+            if tweet_id:
+                logger.info(f"Posted tweet {tweet_id} for tx {event.tx_hash}")
+            else:
+                logger.info(f"Tweet not posted for tx {event.tx_hash}")
+        except Exception:
+            logger.exception(f"Failed to process event tx={event.tx_hash} in block {block_hash}")
+
+    logger.info(f"Finished processing block {block_hash}")
 
 
 def _log_background_task_result(task: asyncio.Task[None]) -> None:
@@ -149,4 +184,4 @@ def _log_background_task_result(task: asyncio.Task[None]) -> None:
     try:
         task.result()
     except Exception:
-        logger.exception("Background block processing failed")
+        logger.exception(f"Background block processing failed: {task.get_name()}")
