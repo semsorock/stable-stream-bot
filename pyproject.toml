@@ -9,11 +9,10 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
-    "psycopg[binary]>=3,<4",
+    "blockfrost-python>=0.7,<1",
     "tenacity>=9,<10",
     "python-dotenv>=1.2.1",
     "xdk>=0.8.1",
-    "paramiko>=3",
 ]
 
 [dependency-groups]

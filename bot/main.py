@@ -3,13 +3,10 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, urlunparse
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .config import get_config
-from .db.repository import close_connection, get_mints_for_block, get_total_supply, set_db_url
-from .db.ssh_tunnel import SSHTunnel, create_tunnel_if_configured
+from .blockfrost_client import get_mints_for_block, get_total_supply
 from .logging import get_logger, setup_logging
 from .twitter.client import post_tweet
 from .twitter.formatter import format_event_tweet
@@ -18,49 +15,13 @@ from .webhook_auth import verify_webhook_signature
 setup_logging()
 logger = get_logger(__name__)
 
-# SSH tunnel instance (if configured)
-_ssh_tunnel: SSHTunnel | None = None
-
-
-def _get_tunneled_url(original_url: str, local_port: int) -> str:
-    """Rewrite db_sync_url to route through the local tunnel port."""
-    parsed = urlparse(original_url)
-    local = f"127.0.0.1:{local_port}"
-    if parsed.password:
-        netloc = f"{parsed.username}:{parsed.password}@{local}"
-    else:
-        netloc = f"{parsed.username}@{local}"
-    return urlunparse(parsed._replace(netloc=netloc))
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle - startup and shutdown."""
-    global _ssh_tunnel
-
-    # Startup
     logger.info("Starting USDM Stream Bot")
-
-    # Start SSH tunnel if configured
-    _ssh_tunnel = create_tunnel_if_configured()
-    if _ssh_tunnel:
-        local_port = _ssh_tunnel.start()
-        logger.info(f"SSH tunnel started on port {local_port}")
-
-        # Update DB URL to use local tunnel
-        config = get_config()
-        tunneled_url = _get_tunneled_url(config.db_sync_url, local_port)
-        set_db_url(tunneled_url)
-
     yield
-
-    # Shutdown
     logger.info("Shutting down USDM Stream Bot")
-
-    if _ssh_tunnel:
-        _ssh_tunnel.stop()
-
-    await close_connection()
 
 
 app = FastAPI(title="USDM Stream Bot", lifespan=lifespan)

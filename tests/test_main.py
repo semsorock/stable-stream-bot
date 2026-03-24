@@ -10,7 +10,7 @@ os.environ.setdefault("API_KEY", "test-api-key")
 os.environ.setdefault("API_SECRET_KEY", "test-api-secret")
 os.environ.setdefault("ACCESS_TOKEN", "test-access-token")
 os.environ.setdefault("ACCESS_TOKEN_SECRET", "test-access-secret")
-os.environ.setdefault("DB_SYNC_URL", "postgresql://user:pass@localhost:5432/db")
+os.environ.setdefault("BLOCKFROST_PROJECT_ID", "mainnetTEST")
 
 import bot.main as main_module
 from bot.models import MintEvent
