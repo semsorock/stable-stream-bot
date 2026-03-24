@@ -5,12 +5,12 @@ A monitoring bot that watches the Cardano blockchain for USDM stablecoin mint/bu
 ## How It Works
 
 ```
-Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Background DB-Sync query → Post to X
+Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Blockfrost API query → Post to X
 ```
 
 1. **Blockfrost** sends block webhooks to `/`
 2. The bot acknowledges the webhook quickly to keep request latency low
-3. Background processing queries a **Cardano DB-Sync** PostgreSQL database for USDM mint/burn events
+3. Background processing queries the **Blockfrost API** for USDM mint/burn events in that block
 4. Formatted summaries are posted to **Twitter/X** via `xdk`
 
 ### What It Monitors
@@ -21,9 +21,8 @@ Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Backg
 ## Prerequisites
 
 - **Google Cloud Platform** account with a project
-- **Cardano DB-Sync** PostgreSQL database access
+- **Blockfrost** account with a mainnet project ID and webhook configured
 - **Twitter/X API** credentials (OAuth 1.0a user tokens)
-- **Blockfrost** account with webhook configured
 
 ## Environment Variables
 
@@ -35,13 +34,9 @@ The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run 
 | `API_SECRET_KEY` | Twitter OAuth 1.0a consumer secret |
 | `ACCESS_TOKEN` | Twitter access token |
 | `ACCESS_TOKEN_SECRET` | Twitter access token secret |
-| `DB_SYNC_URL` | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/dbname`) |
+| `BLOCKFROST_PROJECT_ID` | Blockfrost mainnet project ID (e.g. `mainnetXXXX...`) |
 | `BLOCKFROST_WEBHOOK_AUTH_TOKEN` | Shared secret used to verify `Blockfrost-Signature` |
 | `TWEET_POSTING_ENABLED` | Set to `true` to enable posting tweets (default: `false`) |
-| `SSH_HOST` | Optional bastion host for SSH tunnel to DB |
-| `SSH_PORT` | SSH port (default: `22`) |
-| `SSH_USER` | SSH username for tunnel |
-| `SSH_KEY_PATH` | Path to SSH private key file |
 
 ## Local Development
 
@@ -81,7 +76,7 @@ docker run --rm -p 8080:8080 \
   -e API_SECRET_KEY=your_secret \
   -e ACCESS_TOKEN=your_token \
   -e ACCESS_TOKEN_SECRET=your_token_secret \
-  -e DB_SYNC_URL=postgresql://user:pass@host:5432/dbname \
+  -e BLOCKFROST_PROJECT_ID=mainnetXXXX \
   -e BLOCKFROST_WEBHOOK_AUTH_TOKEN=your_webhook_secret \
   -e TWEET_POSTING_ENABLED=false \
   usdm-stream-bot
@@ -97,7 +92,7 @@ The bot is deployed to **Google Cloud Run** with continuous deployment from this
 
 1. **Store secrets** in Google Secret Manager for your GCP project:
   - `api-key`, `api-secret-key`, `access-token`, `access-token-secret`
-  - `db-sync-url`, `blockfrost-webhook-auth-token`
+  - `blockfrost-project-id`, `blockfrost-webhook-auth-token`
 
 2. **Create a Cloud Run service**:
    - Go to [Cloud Run Console](https://console.cloud.google.com/run)
@@ -128,7 +123,7 @@ Every push to the `main` branch automatically triggers:
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── models.py                # Domain dataclasses
 │   ├── webhook_auth.py          # Blockfrost HMAC signature verification
-│   ├── db/                      # SQL constants + async repository layer + SSH tunnel
+│   ├── blockfrost_client.py     # Blockfrost API queries (mint/burn detection + supply)
 │   └── twitter/
 │       ├── client.py            # XDK posting client
 │       ├── formatter.py         # Tweet composition logic

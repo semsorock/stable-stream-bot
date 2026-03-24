@@ -12,7 +12,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 1. **Blockfrost webhook** → Cloud Run `/` endpoint
 2. **Acknowledge the webhook quickly** to keep request latency low
-3. **Query Cardano DB-Sync** (PostgreSQL) in background for USDM mint/burn transactions
+3. **Query Blockfrost API** in background for USDM mint/burn transactions in the block
 4. **Post tweets** via X API (XDK) with quantity, supply, and Cardanoscan link
 
 ### Project Structure
@@ -27,11 +27,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 │   ├── links.py                 # External link builders (Cardanoscan)
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── webhook_auth.py          # Blockfrost HMAC-SHA256 signature verification
-│   ├── db/
-│   │   ├── __init__.py
-│   │   ├── queries.py           # SQL query constants
-│   │   ├── repository.py        # Async data access layer (typed query functions)
-│   │   └── ssh_tunnel.py        # SSH tunnel for bastion-host DB access (paramiko)
+│   ├── blockfrost_client.py     # Blockfrost API queries (mint/burn detection + supply)
 │   └── twitter/
 │       ├── __init__.py
 │       ├── client.py            # XDK wrapper with TWEET_POSTING_ENABLED gate
@@ -55,9 +51,11 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 - `bot/models.py`: Typed dataclasses for all domain objects:
   - `MintEvent`: USDM mint/burn transaction data
 
-- `bot/db/repository.py`: Async data access functions returning typed model instances. Uses a shared `psycopg.AsyncConnection` (lazy init) with an `asyncio.Lock` to serialise queries.
-
-- `bot/db/ssh_tunnel.py`: SSH port-forwarding tunnel using `paramiko` for accessing PostgreSQL through a bastion host.
+- `bot/blockfrost_client.py`: Async functions that query the Blockfrost API. Uses a stateless cross-referencing algorithm:
+  1. Get block transactions via `api.block_transactions()`
+  2. Get recent USDM mint/burn history via `api.asset_history()`
+  3. Cross-reference to find events in the current block
+  4. Get total supply via `api.asset()` (only if events found)
 
 - `bot/twitter/client.py`: `post_tweet()` via XDK — logs content and only posts when `TWEET_POSTING_ENABLED=true`.
 
@@ -75,26 +73,20 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 - `bot/logging.py`: `setup_logging()` + `get_logger()` — stdlib logging, structured for Cloud Run.
 
-## Database Integration
+## Blockfrost API Integration
 
-### DB-Sync Schema (PostgreSQL)
+The bot queries the **Blockfrost API** (via `blockfrost-python` SDK) to detect USDM mint/burn events. This is a stateless approach — no database or persistent state required.
 
-The bot queries a **Cardano DB-Sync instance** - a full blockchain database. Key tables:
+### Detection Algorithm (per block)
 
-- `ma_tx_mint`: Multi-asset mint/burn records with quantity (positive = mint, negative = burn)
+1. `api.block_transactions(block_hash)` → set of tx hashes in the block
+2. `api.asset_history(USDM_ASSET_ID, order='desc', count=100)` → recent mint/burn events
+3. Cross-reference: filter history entries where `tx_hash` is in the block
+4. `api.asset(USDM_ASSET_ID).quantity` → current total supply (only if events found)
 
-- `multi_asset`: Asset metadata including policy and name
+USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks.
 
-- `tx` / `block`: Transaction and block data
-
-### Queries
-
-All SQL is in `bot/db/queries.py`:
-
-- `QUERY_MINTS`: Get USDM mint/burn transactions by block hash
-- `QUERY_SUPPLY`: Calculate current total USDM supply
-
-**Important**: Transactions are identified by `tx_hash` (hex-encoded).
+**USDM Asset ID**: `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d` (policy ID + CIP-68 label 333 `0014df10` + hex "USDM")
 
 ## External Dependencies & Patterns
 
@@ -108,13 +100,11 @@ The bot generates links to Cardanoscan via `bot/links.py`:
 
 ### Error Handling & Resilience
 
-- Uses `tenacity` library with `@retry` decorator (3 attempts, exponential backoff)
+- Uses `tenacity` library with `@retry` decorator (3 attempts, exponential backoff) on Blockfrost 429 (rate limit) errors
 
-- Async PostgreSQL via `psycopg` (v3) with a shared `AsyncConnection` (lazy init, `autocommit=True`)
+- Blockfrost SDK calls are synchronous, wrapped in `asyncio.to_thread()` for async compatibility
 
-  - Managed in `bot/db/repository.py` — all queries go through async `_query()` helper
-
-  - On connection errors, closes and resets connection so next call reconnects
+- Block transactions and asset history are fetched concurrently via `asyncio.gather()`
 
 ### Environment Variables
 
@@ -122,19 +112,13 @@ Loaded from `.env` file (overrides system env vars) via `python-dotenv`.
 
 ```bash
 # Required
-DB_SYNC_URL                        # PostgreSQL connection string
+BLOCKFROST_PROJECT_ID              # Blockfrost mainnet project ID
 BLOCKFROST_WEBHOOK_AUTH_TOKEN      # Blockfrost webhook HMAC secret
 
 # Twitter (required if TWEET_POSTING_ENABLED=true)
 API_KEY, API_SECRET_KEY            # Twitter OAuth 1.0a
 ACCESS_TOKEN, ACCESS_TOKEN_SECRET  # Twitter access credentials
 TWEET_POSTING_ENABLED              # "true" to enable tweet posting (default: false)
-
-# SSH tunnel (optional — for accessing DB through bastion host)
-SSH_HOST                           # Bastion host address
-SSH_PORT                           # SSH port (default: 22)
-SSH_USER                           # SSH username
-SSH_KEY_PATH                       # Path to SSH private key file
 ```
 
 ### Code Style & Patterns
@@ -183,11 +167,9 @@ uv run ruff check --fix .
 
 ### Testing Workflow
 
-1. **SQL Query Development**: Use `drafts/draft_SELECT.sql` to test queries against DB-Sync
+1. **Webhook Simulation**: Sample payloads are in code comments in `bot/main.py`
 
-2. **Webhook Simulation**: Sample payloads are in code comments in `bot/main.py`
-
-3. **Local Testing**: Set environment variables, then POST webhook JSON to `/` (Blockfrost)
+2. **Local Testing**: Set environment variables, then POST webhook JSON to `/` (Blockfrost)
 
 ## Important Quirks & Edge Cases
 
@@ -205,22 +187,19 @@ uv run ruff check --fix .
 ### Feature Flags
 
 - **Tweet posting**: Controlled by `TWEET_POSTING_ENABLED` env var (default: off)
-- **SSH tunnel**: Enabled when `SSH_HOST` is set in config
 - **Webhook signature verification**: Skipped if `BLOCKFROST_WEBHOOK_AUTH_TOKEN` not set
 
 ## When Modifying Code
 
 ### Adding New Event Types
 
-1. Add query constant to `bot/db/queries.py`
+1. Add data model to `bot/models.py`
 
-2. Add data model to `bot/models.py`
+2. Add Blockfrost query function to `bot/blockfrost_client.py`
 
-3. Add repository function to `bot/db/repository.py`
+3. Add formatter function to `bot/twitter/formatter.py`
 
-4. Add formatter function to `bot/twitter/formatter.py`
-
-5. Add orchestration in `bot/main.py`
+4. Add orchestration in `bot/main.py`
 
 ### Changing Tweet Format
 
@@ -229,14 +208,6 @@ uv run ruff check --fix .
 - Keep under 280 characters (Twitter limit not enforced in code)
 
 - Use emoji consistently: 💵 (mint), 🔥 (burn), 🔗 (links)
-
-### Database Query Changes
-
-- Test queries in `drafts/draft_SELECT.sql` first
-
-- Schema reference in `docs/db_sync_schema.sql`
-
-- Always join through `tx` and `block` tables for block filtering
 
 ## Dependencies Summary
 
@@ -247,10 +218,9 @@ Managed via `uv` (see `pyproject.toml`). Lockfile: `uv.lock`.
 fastapi>=0.115,<1           # Async web framework
 uvicorn[standard]>=0.34,<1  # ASGI server
 xdk>=0.8.1                  # X API SDK (OAuth 1.0a + posts client)
-psycopg[binary]>=3,<4       # Async PostgreSQL adapter (psycopg v3)
+blockfrost-python>=0.6,<1   # Blockfrost API SDK
 tenacity>=9,<10             # Retry/backoff decorator
 python-dotenv>=1.2.1        # .env file loading
-paramiko>=3                 # SSH tunnel for bastion-host DB access
 # Dev
 pytest>=8                   # Test runner
 pytest-asyncio>=0.25        # Async test support (asyncio_mode = "auto")
@@ -260,7 +230,7 @@ ruff>=0.9                   # Formatter + linter
 
 ## Related Documentation
 
-- [Cardano DB-Sync](https://github.com/IntersectMBO/cardano-db-sync): Database schema source
+- [Blockfrost Python SDK](https://github.com/blockfrost/blockfrost-python): API client library
 
 - [USDM Token](https://mehen.io/): Mehen fiat-backed stablecoin
 
