@@ -17,13 +17,21 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return isinstance(exc, ApiError) and exc.status_code == 429
 
 
+def _is_rate_limited_or_not_found(exc: BaseException) -> bool:
+    return isinstance(exc, ApiError) and exc.status_code in (404, 429)
+
+
 @lru_cache(maxsize=1)
 def _get_api() -> BlockFrostApi:
     """Get or create the shared BlockFrost API instance."""
     return BlockFrostApi(project_id=get_config().blockfrost_project_id)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception(_is_rate_limited_or_not_found),
+)
 def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
     """Fetch all transaction hashes for a given block."""
     api = _get_api()
