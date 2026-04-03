@@ -84,8 +84,7 @@ async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
     events = []
     for entry in recent_events:
         if entry["tx_hash"] in block_tx_hashes:
-            quantity = entry["amount"] if entry["action"] == "minted" else -entry["amount"]
-            events.append(MintEvent(tx_hash=entry["tx_hash"], quantity=quantity))
+            events.append(MintEvent(tx_hash=entry["tx_hash"], action=entry["action"], quantity=entry["amount"]))
 
     return events
 

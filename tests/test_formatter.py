@@ -1,12 +1,14 @@
 """Tests for USDM event formatting."""
 
+import pytest
+
 from bot.models import MintEvent
 from bot.twitter.formatter import format_event_tweet
 
 
 def test_format_mint_tweet():
     """Test formatting a mint event tweet."""
-    event = MintEvent(tx_hash="abc123", quantity=1_000_000_000_000)  # 1M USDM
+    event = MintEvent(tx_hash="abc123", action="minted", quantity=1_000_000_000_000)  # 1M USDM
     supply = 50_000_000_000_000  # 50M USDM
 
     tweet = format_event_tweet(event, supply)
@@ -21,7 +23,7 @@ def test_format_mint_tweet():
 
 def test_format_burn_tweet():
     """Test formatting a burn event tweet."""
-    event = MintEvent(tx_hash="def456", quantity=-500_000_000_000)  # -500K USDM
+    event = MintEvent(tx_hash="def456", action="burned", quantity=-500_000_000_000)  # -500K USDM
     supply = 49_500_000_000_000  # 49.5M USDM
 
     tweet = format_event_tweet(event, supply)
@@ -35,8 +37,8 @@ def test_format_burn_tweet():
 
 def test_mint_event_properties():
     """Test MintEvent dataclass properties."""
-    mint = MintEvent(tx_hash="abc", quantity=1_000_000)
-    burn = MintEvent(tx_hash="def", quantity=-1_000_000)
+    mint = MintEvent(tx_hash="abc", action="minted", quantity=1_000_000)
+    burn = MintEvent(tx_hash="def", action="burned", quantity=-1_000_000)
 
     assert mint.is_mint is True
     assert mint.is_burn is False
@@ -45,3 +47,15 @@ def test_mint_event_properties():
     assert burn.is_mint is False
     assert burn.is_burn is True
     assert burn.display_quantity == 1.0
+
+
+def test_mint_event_raises_on_action_quantity_mismatch():
+    """Mismatch between action and quantity sign should fail on property access."""
+    bad_burn = MintEvent(tx_hash="bad1", action="burned", quantity=1)
+    bad_mint = MintEvent(tx_hash="bad2", action="minted", quantity=-1)
+
+    with pytest.raises(ValueError, match="burned quantity"):
+        _ = bad_burn.is_burn
+
+    with pytest.raises(ValueError, match="minted quantity"):
+        _ = bad_mint.is_mint
