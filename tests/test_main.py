@@ -45,7 +45,7 @@ async def test_webhook_accepts_block_and_processes_in_background(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_block_posts_tweets(monkeypatch):
     """Block processing should query the DB and post a formatted tweet."""
-    event = MintEvent(tx_hash="abc123", quantity=1_000_000)
+    event = MintEvent(tx_hash="abc123", action="minted", quantity=1_000_000)
     posted_texts: list[str] = []
 
     async def fake_get_mints_for_block(block_hash: str) -> list[MintEvent]:
