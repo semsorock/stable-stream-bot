@@ -14,8 +14,6 @@ __pycache__
 *.egg-info
 dist
 build
-drafts
-docs
 tests
 *.md
 !README.md

@@ -1,8 +1,8 @@
-# USDM Stream Bot - AI Agent Instructions
+# Stable Stream Bot - AI Agent Instructions
 
 ## Project Purpose
 
-This is a **Cardano blockchain USDM stablecoin monitoring bot** that watches for mint/burn transactions and posts summaries to Twitter/X. It's deployed as a Google Cloud Run service (FastAPI + uvicorn) triggered by Blockfrost block webhooks (`POST /`).
+This is a **Cardano stablecoin monitoring bot** that watches for mint/burn transactions and posts summaries to Twitter/X. USDM is configured by default, and additional stablecoins can be added in `bot/config.py`. It's deployed as a Google Cloud Run service (FastAPI + uvicorn) triggered by Blockfrost block webhooks (`POST /`).
 
 USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad`).
 
@@ -12,8 +12,8 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 1. **Blockfrost webhook** → Cloud Run `/` endpoint
 2. **Acknowledge the webhook quickly** to keep request latency low
-3. **Query Blockfrost API** in background for USDM mint/burn transactions in the block
-4. **Post tweets** via X API (XDK) with quantity, supply, and Cardanoscan link
+3. **Query Blockfrost API** in background for configured stablecoin mint/burn transactions in the block
+4. **Post tweets** via X API (XDK) with quantity, supply, and Cardano Explorer link
 
 ### Project Structure
 
@@ -24,7 +24,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 │   ├── config.py                # Centralised config (.env via dotenv), validation + feature flags
 │   ├── logging.py               # Logging setup (setup_logging, get_logger)
 │   ├── models.py                # Dataclasses: MintEvent
-│   ├── links.py                 # External link builders (Cardanoscan)
+│   ├── links.py                 # External link builders (Cardano Explorer)
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── webhook_auth.py          # Blockfrost HMAC-SHA256 signature verification
 │   ├── blockfrost_client.py     # Blockfrost API queries (mint/burn detection + supply)
@@ -39,9 +39,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 ├── .dockerignore                # Docker build context exclusions
 ├── pyproject.toml               # Project config, dependencies, ruff & pytest settings
 ├── uv.lock                      # Locked dependency versions
-├── Dockerfile                   # Container image (uses uv, non-root user)
-├── docs/                        # Reference docs (DB-Sync schema)
-└── drafts/                      # Development drafts and sample data (not deployed)
+└── Dockerfile                   # Container image (uses uv, non-root user)
 ```
 
 ### Key Components
@@ -49,25 +47,26 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 - `bot/config.py`: All env vars loaded into a frozen `Config` dataclass via `python-dotenv` (`.env` overrides system vars). Includes feature flags.
 
 - `bot/models.py`: Typed dataclasses for all domain objects:
-  - `MintEvent`: USDM mint/burn transaction data
+  - `MintEvent`: Stablecoin mint/burn transaction data
 
-- `bot/blockfrost_client.py`: Async functions that query the Blockfrost API. Uses a stateless cross-referencing algorithm:
+- `bot/blockfrost_client.py`: Async functions that query the Blockfrost API. Uses a stateless cross-referencing algorithm for each configured stablecoin:
   1. Get block transactions via `api.block_transactions()`
-  2. Get recent USDM mint/burn history via `api.asset_history()`
+  2. Get recent stablecoin mint/burn history via `api.asset_history()`
   3. Cross-reference to find events in the current block
-  4. Get total supply via `api.asset()` (only if events found)
+  4. Get total supply via `api.asset()` for stablecoins with events
 
 - `bot/twitter/client.py`: `post_tweet()` via XDK — logs content and only posts when `TWEET_POSTING_ENABLED=true`.
 
 - `bot/twitter/formatter.py`: Pure functions that build tweet text strings:
-  - `format_mint_tweet()`: USDM mint event
-  - `format_burn_tweet()`: USDM burn event
+  - `format_mint_tweet()`: Stablecoin mint event
+  - `format_burn_tweet()`: Stablecoin burn event
+  - `format_event_tweet()`: Routes an event to the appropriate formatter
 
 - `bot/twitter/templates.py`: Centralised tweet copy templates:
-  - `MINT`: USDM minted template
-  - `BURN`: USDM burned template
+  - `MINT`: Stablecoin minted template
+  - `BURN`: Stablecoin burned template
 
-- `bot/links.py`: URL builders for Cardanoscan.
+- `bot/links.py`: URL builders for Cardano Explorer.
 
 - `bot/main.py`: FastAPI `app` instance with a fast-ack `POST /` webhook handler that continues block processing asynchronously in-process.
 
@@ -75,16 +74,16 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 ## Blockfrost API Integration
 
-The bot queries the **Blockfrost API** (via `blockfrost-python` SDK) to detect USDM mint/burn events. This is a stateless approach — no database or persistent state required.
+The bot queries the **Blockfrost API** (via `blockfrost-python` SDK) to detect configured stablecoin mint/burn events. This is a stateless approach — no database or persistent state required.
 
 ### Detection Algorithm (per block)
 
 1. `api.block_transactions(block_hash)` → set of tx hashes in the block
-2. `api.asset_history(USDM_ASSET_ID, order='desc', count=100)` → recent mint/burn events
-3. Cross-reference: filter history entries where `tx_hash` is in the block
-4. `api.asset(USDM_ASSET_ID).quantity` → current total supply (only if events found)
+2. For every entry in `STABLECOINS`, call `api.asset_history(asset_id, order='desc', count=100)`
+3. Cross-reference each history with the block transaction hashes
+4. `api.asset(asset_id).quantity` → current total supply for each stablecoin with events
 
-USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks.
+USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks. Revisit this fixed history window before configuring a high-activity asset.
 
 **USDM Asset ID**: `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d` (policy ID + CIP-68 label 333 `0014df10` + hex "USDM")
 
@@ -92,7 +91,7 @@ USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks.
 
 ### External Links
 
-The bot generates links to Cardanoscan via `bot/links.py`:
+The bot generates links to Cardano Explorer via `bot/links.py`:
 
 - **Cardano Explorer**: `make_explorer_link(tx_hash)` → `https://explorer.cardano.org/transaction/{tx_hash}`
 
@@ -100,7 +99,7 @@ The bot generates links to Cardanoscan via `bot/links.py`:
 
 ### Error Handling & Resilience
 
-- Uses `tenacity` library with `@retry` decorator (3 attempts, exponential backoff) on Blockfrost 429 (rate limit) errors
+- Uses `tenacity` with exponential backoff: five attempts for block transaction lookup on Blockfrost 404/429 responses, and three attempts for other rate-limited calls
 
 - Blockfrost SDK calls are synchronous, wrapped in `asyncio.to_thread()` for async compatibility
 
@@ -111,13 +110,13 @@ The bot generates links to Cardanoscan via `bot/links.py`:
 Loaded from `.env` file (overrides system env vars) via `python-dotenv`.
 
 ```bash
-# Required
+# Currently required by the configuration loader
 BLOCKFROST_PROJECT_ID              # Blockfrost mainnet project ID
-BLOCKFROST_WEBHOOK_AUTH_TOKEN      # Blockfrost webhook HMAC secret
-
-# Twitter (required if TWEET_POSTING_ENABLED=true)
 API_KEY, API_SECRET_KEY            # Twitter OAuth 1.0a
 ACCESS_TOKEN, ACCESS_TOKEN_SECRET  # Twitter access credentials
+
+# Optional
+BLOCKFROST_WEBHOOK_AUTH_TOKEN      # Blockfrost webhook HMAC secret
 TWEET_POSTING_ENABLED              # "true" to enable tweet posting (default: false)
 ```
 
@@ -167,16 +166,14 @@ uv run ruff check --fix .
 
 ### Testing Workflow
 
-1. **Webhook Simulation**: Sample payloads are in code comments in `bot/main.py`
-
-2. **Local Testing**: Set environment variables, then POST webhook JSON to `/` (Blockfrost)
+Set environment variables, then POST a Blockfrost block-event JSON payload to `/`.
 
 ## Important Quirks & Edge Cases
 
 ### Mint vs Burn Detection
 
-- `quantity > 0` → MINT event
-- `quantity < 0` → BURN event
+- Use Blockfrost's `action` field (`minted` or `burned`) to classify the event.
+- Blockfrost history amounts are magnitudes; do not infer the action from the amount's sign.
 
 ### USDM Token Details
 
@@ -218,7 +215,7 @@ Managed via `uv` (see `pyproject.toml`). Lockfile: `uv.lock`.
 fastapi>=0.115,<1           # Async web framework
 uvicorn[standard]>=0.34,<1  # ASGI server
 xdk>=0.8.1                  # X API SDK (OAuth 1.0a + posts client)
-blockfrost-python>=0.6,<1   # Blockfrost API SDK
+blockfrost-python>=0.7,<1   # Blockfrost API SDK
 tenacity>=9,<10             # Retry/backoff decorator
 python-dotenv>=1.2.1        # .env file loading
 # Dev
