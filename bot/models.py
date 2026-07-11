@@ -1,18 +1,21 @@
-"""Domain dataclasses for USDM events."""
+"""Domain dataclasses for stablecoin events."""
 
 from dataclasses import dataclass
 from typing import Literal
+
+from .config import Stablecoin
 
 EventAction = Literal["minted", "burned"]
 
 
 @dataclass(frozen=True)
 class MintEvent:
-    """A USDM mint or burn event."""
+    """A stablecoin mint or burn event."""
 
     tx_hash: str
     action: EventAction
     quantity: int  # Keep Blockfrost amount exactly as returned by API
+    stablecoin: Stablecoin
 
     def _validate_action_quantity_match(self) -> None:
         """Ensure action and amount sign agree with Blockfrost semantics."""
@@ -35,6 +38,6 @@ class MintEvent:
 
     @property
     def display_quantity(self) -> float:
-        """Quantity in display units (divided by 1,000,000)."""
+        """Quantity in display units."""
         self._validate_action_quantity_match()
-        return abs(self.quantity) / 1_000_000
+        return abs(self.quantity) / 10**self.stablecoin.decimals

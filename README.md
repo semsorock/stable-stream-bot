@@ -1,6 +1,6 @@
-# USDM Stream Bot
+# Stable Stream Bot
 
-A monitoring bot that watches the Cardano blockchain for USDM stablecoin mint/burn transactions and posts summaries to Twitter/X.
+A monitoring bot that watches the Cardano blockchain for configured stablecoin mint/burn transactions and posts summaries to Twitter/X.
 
 ## How It Works
 
@@ -10,13 +10,31 @@ Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Block
 
 1. **Blockfrost** sends block webhooks to `/`
 2. The bot acknowledges the webhook quickly to keep request latency low
-3. Background processing queries the **Blockfrost API** for USDM mint/burn events in that block
+3. Background processing queries the **Blockfrost API** for configured stablecoin mint/burn events in that block
 4. Formatted summaries are posted to **Twitter/X** via `xdk`
 
-### What It Monitors
+### Stablecoin Configuration
 
-- 💵 **USDM Mints** — new stablecoin issuance
-- 🔥 **USDM Burns** — stablecoin redemptions
+Stablecoins are configured in `bot/config.py`. USDM is included by default. Add another `Stablecoin` entry to the `STABLECOINS` tuple with its ticker, policy ID, full Blockfrost asset ID, and decimal count:
+
+```python
+STABLECOINS = (
+    Stablecoin(
+        ticker="USDM",
+        policy_id="...",
+        asset_id="...",
+        decimals=6,
+    ),
+    Stablecoin(
+        ticker="ANOTHER",
+        policy_id="...",
+        asset_id="...",
+        decimals=6,
+    ),
+)
+```
+
+For every configured stablecoin, the bot monitors both mints and burns.
 
 ## Prerequisites
 
@@ -42,8 +60,8 @@ The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run 
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/usdm-stream-bot.git
-cd usdm-stream-bot
+git clone https://github.com/semsorock/stable-stream-bot.git
+cd stable-stream-bot
 
 # Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -70,7 +88,7 @@ uv run ruff check --fix .
 ### Local Docker Build
 
 ```bash
-docker build -t usdm-stream-bot .
+docker build -t stable-stream-bot .
 docker run --rm -p 8080:8080 \
   -e API_KEY=your_key \
   -e API_SECRET_KEY=your_secret \
@@ -79,7 +97,7 @@ docker run --rm -p 8080:8080 \
   -e BLOCKFROST_PROJECT_ID=mainnetXXXX \
   -e BLOCKFROST_WEBHOOK_AUTH_TOKEN=your_webhook_secret \
   -e TWEET_POSTING_ENABLED=false \
-  usdm-stream-bot
+  stable-stream-bot
 ```
 
 ## Deployment
@@ -117,7 +135,7 @@ Every push to the `main` branch automatically triggers:
 ```
 ├── main.py                      # Entry point shim (re-exports FastAPI app)
 ├── bot/
-│   ├── config.py                # Centralised env config + feature flags
+│   ├── config.py                # Environment and monitored stablecoin config
 │   ├── links.py                 # External link builders (Cardanoscan)
 │   ├── logging.py               # Structured logging setup
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler

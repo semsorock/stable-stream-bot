@@ -19,12 +19,12 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle - startup and shutdown."""
-    logger.info("Starting USDM Stream Bot")
+    logger.info("Starting Stable Stream Bot")
     yield
-    logger.info("Shutting down USDM Stream Bot")
+    logger.info("Shutting down Stable Stream Bot")
 
 
-app = FastAPI(title="USDM Stream Bot", lifespan=lifespan)
+app = FastAPI(title="Stable Stream Bot", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -75,27 +75,29 @@ async def webhook(request: Request):
 
 
 async def _process_block(block_hash: str) -> None:
-    """Process a block for USDM mint/burn events."""
+    """Process a block for stablecoin mint/burn events."""
     logger.info(f"Processing block: {block_hash}")
 
     # Get all mint/burn events for this block
     events = await get_mints_for_block(block_hash)
 
     if not events:
-        logger.info(f"No USDM events in block {block_hash}")
+        logger.info(f"No stablecoin events in block {block_hash}")
         return
 
-    logger.info(f"Found {len(events)} USDM event(s) in block {block_hash}")
+    logger.info(f"Found {len(events)} stablecoin event(s) in block {block_hash}")
 
-    # Get current total supply
-    supply = await get_total_supply()
-    logger.info(f"Current total supply: {supply}")
+    # Get the current supply once for each stablecoin found in the block.
+    stablecoins = list(dict.fromkeys(event.stablecoin for event in events))
+    supplies = await asyncio.gather(*(get_total_supply(stablecoin.asset_id) for stablecoin in stablecoins))
+    supply_by_asset_id = dict(zip((stablecoin.asset_id for stablecoin in stablecoins), supplies, strict=True))
 
     # Process each event
     for event in events:
-        logger.info(f"Processing event: tx={event.tx_hash}, quantity={event.quantity}")
+        logger.info(f"Processing {event.stablecoin.ticker} event: tx={event.tx_hash}, quantity={event.quantity}")
 
         # Format and post tweet
+        supply = supply_by_asset_id[event.stablecoin.asset_id]
         tweet_text = format_event_tweet(event, supply)
         tweet_id = await asyncio.to_thread(post_tweet, tweet_text)
 

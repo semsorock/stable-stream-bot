@@ -30,6 +30,16 @@ class Config:
     tweet_posting_enabled: bool
 
 
+@dataclass(frozen=True)
+class Stablecoin:
+    """A stablecoin monitored by the bot."""
+
+    ticker: str
+    policy_id: str
+    asset_id: str
+    decimals: int
+
+
 @lru_cache(maxsize=1)
 def get_config() -> Config:
     """Load and cache configuration from environment variables."""
@@ -57,7 +67,12 @@ def get_config() -> Config:
     )
 
 
-# USDM token details
-USDM_POLICY_ID = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad"
-USDM_ASSET_ID = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d"
-USDM_DECIMALS = 6
+USDM = Stablecoin(
+    ticker="USDM",
+    policy_id="c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad",
+    asset_id="c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d",
+    decimals=6,
+)
+
+# Add stablecoins to this tuple to monitor them.
+STABLECOINS = (USDM,)

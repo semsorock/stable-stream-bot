@@ -1,4 +1,4 @@
-"""Blockfrost API client for querying USDM mint/burn events."""
+"""Blockfrost API client for querying stablecoin mint/burn events."""
 
 import asyncio
 from functools import lru_cache
@@ -6,7 +6,7 @@ from functools import lru_cache
 from blockfrost import ApiError, BlockFrostApi
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-from .config import USDM_ASSET_ID, get_config
+from .config import STABLECOINS, get_config
 from .logging import get_logger
 from .models import MintEvent
 
@@ -49,10 +49,10 @@ def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
-def _fetch_recent_mint_burns() -> list[dict]:
-    """Fetch recent USDM mint/burn history entries."""
+def _fetch_recent_mint_burns(asset_id: str) -> list[dict]:
+    """Fetch recent mint/burn history entries for an asset."""
     api = _get_api()
-    history = api.asset_history(USDM_ASSET_ID, order="desc", count=100)
+    history = api.asset_history(asset_id, order="desc", count=100)
     return [
         {"tx_hash": entry.tx_hash, "action": entry.action, "amount": int(entry.amount)}
         for entry in history
@@ -61,34 +61,43 @@ def _fetch_recent_mint_burns() -> list[dict]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
-def _fetch_total_supply() -> int:
-    """Fetch the current total USDM supply."""
+def _fetch_total_supply(asset_id: str) -> int:
+    """Fetch the current total supply for an asset."""
     api = _get_api()
-    asset = api.asset(USDM_ASSET_ID)
+    asset = api.asset(asset_id)
     return int(asset.quantity)
 
 
 async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
-    """Get USDM mint/burn events for a specific block."""
+    """Get configured stablecoin mint/burn events for a specific block."""
     logger.info(f"Querying Blockfrost for block {block_hash}")
 
-    # Fetch block transactions and recent mint/burn history concurrently
-    block_tx_hashes, recent_events = await asyncio.gather(
+    # Fetch block transactions once and each stablecoin's history concurrently.
+    block_tx_hashes, *stablecoin_histories = await asyncio.gather(
         asyncio.to_thread(_fetch_block_tx_hashes, block_hash),
-        asyncio.to_thread(_fetch_recent_mint_burns),
+        *(asyncio.to_thread(_fetch_recent_mint_burns, stablecoin.asset_id) for stablecoin in STABLECOINS),
     )
 
-    logger.info(f"Block has {len(block_tx_hashes)} transactions, history has {len(recent_events)} recent events")
+    history_count = sum(len(history) for history in stablecoin_histories)
+    logger.info(f"Block has {len(block_tx_hashes)} transactions, histories have {history_count} recent events")
 
     # Cross-reference: find mint/burn events that belong to this block
     events = []
-    for entry in recent_events:
-        if entry["tx_hash"] in block_tx_hashes:
-            events.append(MintEvent(tx_hash=entry["tx_hash"], action=entry["action"], quantity=entry["amount"]))
+    for stablecoin, recent_events in zip(STABLECOINS, stablecoin_histories, strict=True):
+        for entry in recent_events:
+            if entry["tx_hash"] in block_tx_hashes:
+                events.append(
+                    MintEvent(
+                        tx_hash=entry["tx_hash"],
+                        action=entry["action"],
+                        quantity=entry["amount"],
+                        stablecoin=stablecoin,
+                    )
+                )
 
     return events
 
 
-async def get_total_supply() -> int:
-    """Get the current total USDM supply."""
-    return await asyncio.to_thread(_fetch_total_supply)
+async def get_total_supply(asset_id: str) -> int:
+    """Get the current total supply for an asset."""
+    return await asyncio.to_thread(_fetch_total_supply, asset_id)
