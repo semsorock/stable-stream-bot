@@ -94,7 +94,7 @@ USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks.
 
 The bot generates links to Cardanoscan via `bot/links.py`:
 
-- **Cardanoscan**: `make_cardanoscan_link(tx_hash)` → `https://cardanoscan.io/transaction/{tx_hash}?tab=tokenmint`
+- **Cardano Explorer**: `make_explorer_link(tx_hash)` → `https://explorer.cardano.org/transaction/{tx_hash}`
 
 ## Development Patterns
 

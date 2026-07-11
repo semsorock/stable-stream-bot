@@ -1,6 +1,6 @@
 """External link builders."""
 
 
-def make_cardanoscan_link(tx_hash: str) -> str:
-    """Build a Cardanoscan transaction link with tokenmint tab."""
-    return f"https://cardanoscan.io/transaction/{tx_hash}?tab=tokenmint"
+def make_explorer_link(tx_hash: str) -> str:
+    """Build a Cardano Explorer transaction link."""
+    return f"https://explorer.cardano.org/transaction/{tx_hash}"

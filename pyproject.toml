@@ -1,7 +1,7 @@
 [project]
-name = "usdm-stream-bot"
+name = "stable-stream-bot"
 version = "0.1.0"
-description = "Cardano USDM stablecoin mint/burn monitoring bot for Twitter/X"
+description = "Cardano stablecoin mint/burn monitoring bot for Twitter/X"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
