@@ -173,7 +173,7 @@ Set environment variables, then POST a Blockfrost block-event JSON payload to `/
 ### Mint vs Burn Detection
 
 - Use Blockfrost's `action` field (`minted` or `burned`) to classify the event.
-- Blockfrost history amounts are magnitudes; do not infer the action from the amount's sign.
+- The live Blockfrost API returns signed history amounts: positive for mints and negative for burns. Validate that the sign agrees with `action`; the OpenAPI example incorrectly shows positive burn amounts.
 
 ### USDM Token Details
 
