@@ -1,6 +1,6 @@
 # Stable Stream Bot
 
-A monitoring bot that watches the Cardano blockchain for configured stablecoin mint/burn transactions and posts summaries to Twitter/X.
+A Cardano monitoring bot that watches configured stablecoins for mint and burn transactions and posts summaries to Twitter/X. USDM is configured by default.
 
 ## How It Works
 
@@ -40,11 +40,11 @@ For every configured stablecoin, the bot monitors both mints and burns.
 
 - **Google Cloud Platform** account with a project
 - **Blockfrost** account with a mainnet project ID and webhook configured
-- **Twitter/X API** credentials (OAuth 1.0a user tokens)
+- **Twitter/X API** credentials (OAuth 1.0a user tokens; posting is disabled by default)
 
 ## Environment Variables
 
-The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run environment variables / Secret Manager.
+The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run environment variables or Secret Manager. The current configuration loader requires the four Twitter credentials and the Blockfrost project ID even when tweet posting is disabled; the webhook authentication token is optional.
 
 | Variable | Description |
 |---|---|
@@ -53,7 +53,7 @@ The bot loads `.env` locally (`python-dotenv`) and can also read from Cloud Run 
 | `ACCESS_TOKEN` | Twitter access token |
 | `ACCESS_TOKEN_SECRET` | Twitter access token secret |
 | `BLOCKFROST_PROJECT_ID` | Blockfrost mainnet project ID (e.g. `mainnetXXXX...`) |
-| `BLOCKFROST_WEBHOOK_AUTH_TOKEN` | Shared secret used to verify `Blockfrost-Signature` |
+| `BLOCKFROST_WEBHOOK_AUTH_TOKEN` | Optional shared secret used to verify `Blockfrost-Signature`; verification is skipped when omitted |
 | `TWEET_POSTING_ENABLED` | Set to `true` to enable posting tweets (default: `false`) |
 
 ## Local Development
@@ -136,7 +136,7 @@ Every push to the `main` branch automatically triggers:
 ├── main.py                      # Entry point shim (re-exports FastAPI app)
 ├── bot/
 │   ├── config.py                # Environment and monitored stablecoin config
-│   ├── links.py                 # External link builders (Cardanoscan)
+│   ├── links.py                 # External link builders (Cardano Explorer)
 │   ├── logging.py               # Structured logging setup
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── models.py                # Domain dataclasses
@@ -147,7 +147,6 @@ Every push to the `main` branch automatically triggers:
 │       ├── formatter.py         # Tweet composition logic
 │       └── templates.py         # Editable tweet templates
 ├── tests/                       # Pytest test suite
-├── docs/                        # Reference docs (schema)
 ├── pyproject.toml               # Dependency/tool config
 ├── uv.lock                      # Locked dependency versions
 ├── Dockerfile                   # Container image
