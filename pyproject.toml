@@ -16,7 +16,7 @@ dependencies = [
     "blockfrost-python>=0.7,<1",
     "tenacity>=9,<10",
     "python-dotenv>=1.2.1",
-    "xdk>=0.8.1",
+    "xdk>=0.10.0",
 ]
 
 [dependency-groups]
