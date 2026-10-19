@@ -30,6 +30,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
 │   ├── webhook_auth.py          # Blockfrost HMAC-SHA256 signature verification
 │   ├── blockfrost_client.py     # Blockfrost API queries (mint/burn detection + supply)
+│   ├── blockfrost_transport.py  # SDK-compatible reads with connect/read timeouts
 │   └── twitter/
 │       ├── __init__.py
 │       ├── client.py            # XDK wrapper with TWEET_POSTING_ENABLED gate
@@ -114,11 +115,11 @@ The bot generates links to Cardano Explorer via `bot/links.py`:
 
 ### Error Handling & Resilience
 
-- All Blockfrost reads retry connection errors, timeouts, 429, and 5xx using `tenacity` with exponential backoff. History pages and supply reads make at most three attempts; block transactions, metadata, and history-boundary lookups make at most five and also retry indexing-related 404 responses. Other 4xx errors are not retried. Each retry logs a warning; only reads are retried, never X post creation or whole blocks.
+- All Blockfrost reads use a local SDK-compatible adapter with 3.05-second connect and 10-second read-idle timeouts. No global socket or requests defaults are changed. Two shared `tenacity` policies make at most five attempts on connection errors, truncated responses (`ChunkedEncodingError`), timeouts, 429, and 5xx, with jittered exponential backoff (1–8 seconds per wait). Block-related reads also retry indexing-related 404 responses at INFO; other retries log WARNING. Other 4xx errors are not retried. Both block transactions and histories retry each page independently; X post creation and whole blocks are never retried.
 
 - Metadata (timestamp and height) is shared within each block request. Activation-gated tokens verify time before history lookup, avoiding lifetime scans on old replays. A bounded cache of boundary transaction heights avoids repeat calls for quiet tokens. Later-page or boundary failures retain collected history and explicitly log that history is incomplete; initial history failures and individual event failures leave other tokens/events processing. Cancellation propagates.
 
-- Blockfrost SDK calls are synchronous, wrapped in `asyncio.to_thread()` for async compatibility
+- Blockfrost SDK-compatible calls are synchronous, dispatched with `run_in_executor()` to a dedicated eight-worker pool. Network I/O and backoff do not occupy the shared executor used for X posting. This bounds worker concurrency, not queued webhook backlog; no durable replay queue exists.
 
 - Block transactions and asset history are fetched concurrently via `asyncio.gather()`
 

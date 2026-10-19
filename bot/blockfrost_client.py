@@ -2,23 +2,27 @@
 
 import asyncio
 import logging
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from functools import lru_cache, partial
 from threading import Lock
 
-from blockfrost import ApiError, BlockFrostApi
-from requests.exceptions import ConnectionError, Timeout
-from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
+from blockfrost import ApiError
+from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
+from tenacity import RetryCallState, Retrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 
+from .blockfrost_transport import TimeoutBlockFrostApi
 from .config import STABLECOINS, Stablecoin, get_config
 from .logging import get_logger
 from .models import MintEvent
 
 logger = get_logger(__name__)
+_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="blockfrost")
 
 
 def _is_transient_error(exc: BaseException) -> bool:
     """Retry safe reads on transport failures, rate limits, and server errors."""
-    return isinstance(exc, (ConnectionError, Timeout)) or (
+    return isinstance(exc, (ConnectionError, Timeout, ChunkedEncodingError)) or (
         isinstance(exc, ApiError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
     )
 
@@ -28,25 +32,49 @@ def _is_transient_or_not_found(exc: BaseException) -> bool:
     return _is_transient_error(exc) or (isinstance(exc, ApiError) and exc.status_code == 404)
 
 
+def _log_retry(state: RetryCallState) -> None:
+    error = state.outcome.exception()
+    level = logging.INFO if isinstance(error, ApiError) and error.status_code == 404 else logging.WARNING
+    logger.log(
+        level,
+        "Retrying %s in %.2fs after attempt %s: %s",
+        state.fn.__name__,
+        state.next_action.sleep,
+        state.attempt_number,
+        error,
+    )
+
+
+def _read_retry(predicate):
+    return Retrying(
+        stop=stop_after_attempt(5),
+        wait=wait_random_exponential(multiplier=2, min=1, max=8),
+        retry=retry_if_exception(predicate),
+        before_sleep=_log_retry,
+    ).wraps
+
+
+_retry_read = _read_retry(_is_transient_error)
+_retry_block_read = _read_retry(_is_transient_or_not_found)
+
+
 @lru_cache(maxsize=1)
-def _get_api() -> BlockFrostApi:
-    """Get or create the shared BlockFrost API instance."""
-    return BlockFrostApi(project_id=get_config().blockfrost_project_id)
+def _get_api() -> TimeoutBlockFrostApi:
+    """Get or create the SDK-compatible, timeout-bounded read client."""
+    return TimeoutBlockFrostApi(project_id=get_config().blockfrost_project_id)
 
 
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_transient_or_not_found),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
+@_retry_block_read
+def _fetch_block_transactions_page(block_hash: str, page: int):
+    return _get_api().block_transactions(block_hash, count=100, page=page)
+
+
 def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
     """Fetch all transaction hashes for a given block."""
-    api = _get_api()
     tx_hashes: set[str] = set()
     page = 1
     while True:
-        results = api.block_transactions(block_hash, page=page)
+        results = _fetch_block_transactions_page(block_hash, page)
         if not results:
             break
         tx_hashes.update(results)
@@ -56,12 +84,7 @@ def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
     return tx_hashes
 
 
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_transient_or_not_found),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
+@_retry_block_read
 def _fetch_block_metadata(block_hash: str):
     """Read authoritative time and height, retrying transient Blockfrost failures."""
     return _get_api().block(block_hash)
@@ -100,12 +123,7 @@ class _BlockMetadata:
 
 
 @lru_cache(maxsize=4096)
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_transient_or_not_found),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
+@_retry_block_read
 def _fetch_transaction_block_height(tx_hash: str) -> int:
     """Cache page-boundary transaction heights so quiet histories need no repeated lookup."""
     height = getattr(_get_api().transaction(tx_hash), "block_height", None)
@@ -114,12 +132,7 @@ def _fetch_transaction_block_height(tx_hash: str) -> int:
     return height
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=1, max=10),
-    retry=retry_if_exception(_is_transient_error),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
+@_retry_read
 def _fetch_history_page(asset_id: str, page: int):
     return _get_api().asset_history(asset_id, order="desc", count=100, page=page)
 
@@ -161,12 +174,7 @@ def _fetch_recent_mint_burns(asset_id: str, block: _BlockMetadata) -> list[dict]
     return events
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=1, max=10),
-    retry=retry_if_exception(_is_transient_error),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
+@_retry_read
 def _fetch_total_supply(asset_id: str) -> int:
     """Fetch the current total supply for an asset."""
     api = _get_api()
@@ -181,7 +189,7 @@ async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
     timestamp = None
     if any(stablecoin.activation_timestamp is not None for stablecoin in STABLECOINS):
         try:
-            timestamp = await asyncio.to_thread(block.timestamp)
+            timestamp = await _run_read(block.timestamp)
         except Exception:
             logger.exception(f"Cannot verify block time for {block_hash}; suppressing activation-gated events")
     # Reject historical rollouts before reading their history, which can otherwise
@@ -190,8 +198,8 @@ async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
 
     # Fetch block transactions once and each stablecoin's history concurrently.
     block_tx_hashes, *stablecoin_histories = await asyncio.gather(
-        asyncio.to_thread(_fetch_block_tx_hashes, block_hash),
-        *(asyncio.to_thread(_fetch_recent_mint_burns, stablecoin.asset_id, block) for stablecoin in stablecoins),
+        _run_read(_fetch_block_tx_hashes, block_hash),
+        *(_run_read(_fetch_recent_mint_burns, stablecoin.asset_id, block) for stablecoin in stablecoins),
         return_exceptions=True,
     )
     if isinstance(block_tx_hashes, BaseException):
@@ -256,4 +264,9 @@ def _filter_reportable_events(events: list[MintEvent], timestamp: int | None) ->
 
 async def get_total_supply(asset_id: str) -> int:
     """Get the current total supply for an asset."""
-    return await asyncio.to_thread(_fetch_total_supply, asset_id)
+    return await _run_read(_fetch_total_supply, asset_id)
+
+
+async def _run_read(function, *args):
+    """Keep Blockfrost I/O and backoff off the executor used by X and other work."""
+    return await asyncio.get_running_loop().run_in_executor(_executor, copy_context().run, partial(function, *args))
