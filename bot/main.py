@@ -10,6 +10,7 @@ from .blockfrost_client import get_mints_for_block, get_total_supply
 from .logging import get_logger, setup_logging
 from .twitter.client import post_tweet
 from .twitter.formatter import format_event_tweet
+from .twitter.media import get_event_banner
 from .webhook_auth import verify_webhook_signature
 
 setup_logging()
@@ -78,16 +79,28 @@ async def _process_block(block_hash: str) -> None:
     """Process a block for stablecoin mint/burn events."""
     logger.info(f"Processing block: {block_hash}")
 
-    # Get all mint/burn events for this block
-    events = await get_mints_for_block(block_hash)
+    # Filter before supply queries and media uploads, using exact smallest-unit amounts.
+    events = []
+    for event in await get_mints_for_block(block_hash):
+        if abs(event.quantity) < event.stablecoin.min_post_amount * 10**event.stablecoin.decimals:
+            logger.info(
+                "Skipping %s %s below %s-token threshold: tx=%s, quantity=%s",
+                event.stablecoin.ticker,
+                event.action,
+                event.stablecoin.min_post_amount,
+                event.tx_hash,
+                event.quantity,
+            )
+            continue
+        events.append(event)
 
     if not events:
-        logger.info(f"No stablecoin events in block {block_hash}")
+        logger.info(f"No reportable stablecoin events in block {block_hash}")
         return
 
     logger.info(f"Found {len(events)} stablecoin event(s) in block {block_hash}")
 
-    # Get the current supply once for each stablecoin found in the block.
+    # Get the current supply once for each stablecoin with reportable events.
     stablecoins = list(dict.fromkeys(event.stablecoin for event in events))
     supplies = await asyncio.gather(*(get_total_supply(stablecoin.asset_id) for stablecoin in stablecoins))
     supply_by_asset_id = dict(zip((stablecoin.asset_id for stablecoin in stablecoins), supplies, strict=True))
@@ -99,7 +112,12 @@ async def _process_block(block_hash: str) -> None:
         # Format and post tweet
         supply = supply_by_asset_id[event.stablecoin.asset_id]
         tweet_text = format_event_tweet(event, supply)
-        tweet_id = await asyncio.to_thread(post_tweet, tweet_text)
+        tweet_id = await asyncio.to_thread(
+            post_tweet,
+            tweet_text,
+            image_path=get_event_banner(event),
+            image_alt_text=f"{event.stablecoin.ticker} — {event.action.upper()}",
+        )
 
         if tweet_id:
             logger.info(f"Posted tweet {tweet_id} for tx {event.tx_hash}")

@@ -4,13 +4,9 @@
 MINT = """💵 ${ticker} has been MINTED!
 quantity: +{quantity}
 total supply: {supply}
-{link}
-
-#cardano #blockchain #stablecoin"""
+{link}"""
 
 BURN = """🔥 ${ticker} has been BURNED!
 quantity: -{quantity}
 total supply: {supply}
-{link}
-
-#cardano #blockchain #stablecoin"""
+{link}"""

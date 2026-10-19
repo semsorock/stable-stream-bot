@@ -31,6 +31,9 @@ dev = [
 include = ["bot*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+bot = ["assets/banners/*.png"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

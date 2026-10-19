@@ -48,6 +48,19 @@ def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
     return tx_hashes
 
 
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception(_is_rate_limited_or_not_found),
+)
+def _fetch_block_timestamp(block_hash: str) -> int:
+    """Read authoritative block time, never a timestamp supplied by a webhook."""
+    timestamp = getattr(_get_api().block(block_hash), "time", None)
+    if type(timestamp) is not int or timestamp < 0:
+        raise ValueError(f"Invalid timestamp for block {block_hash}")
+    return timestamp
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
 def _fetch_recent_mint_burns(asset_id: str) -> list[dict]:
     """Fetch recent mint/burn history entries for an asset."""
@@ -94,6 +107,26 @@ async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
                         stablecoin=stablecoin,
                     )
                 )
+
+    return await _filter_active_events(block_hash, events)
+
+
+async def _filter_active_events(block_hash: str, events: list[MintEvent]) -> list[MintEvent]:
+    """Suppress events predating their token's fixed activation boundary."""
+    # A fixed per-token rollout boundary prevents historical/replayed webhooks
+    # from announcing old events. USDM has no boundary and keeps its old behavior.
+    if any(event.stablecoin.activation_timestamp is not None for event in events):
+        try:
+            timestamp = await asyncio.to_thread(_fetch_block_timestamp, block_hash)
+        except Exception:
+            logger.exception(f"Cannot verify block time for {block_hash}; suppressing activation-gated events")
+            return [event for event in events if event.stablecoin.activation_timestamp is None]
+
+        events = [
+            event
+            for event in events
+            if event.stablecoin.activation_timestamp is None or timestamp >= event.stablecoin.activation_timestamp
+        ]
 
     return events
 

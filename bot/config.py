@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -38,6 +39,8 @@ class Stablecoin:
     policy_id: str
     asset_id: str
     decimals: int
+    activation_timestamp: int | None = None
+    min_post_amount: int = 0  # Whole tokens; applies equally to mints and burns.
 
 
 @lru_cache(maxsize=1)
@@ -74,5 +77,25 @@ USDM = Stablecoin(
     decimals=6,
 )
 
+# Fixed rollout boundary: 2026-10-19 00:00 Europe/Istanbul. Never advances on restart.
+NEW_STABLECOINS_ACTIVATED_AT = int(datetime(2026, 10, 18, 21, tzinfo=UTC).timestamp())
+
+USDCX = Stablecoin(
+    ticker="USDCx",
+    policy_id="1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34",
+    asset_id="1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378",
+    decimals=6,
+    activation_timestamp=NEW_STABLECOINS_ACTIVATED_AT,
+    min_post_amount=10_000,
+)
+
+USDA = Stablecoin(
+    ticker="USDA",
+    policy_id="fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456",
+    asset_id="fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae45655534441",
+    decimals=6,
+    activation_timestamp=NEW_STABLECOINS_ACTIVATED_AT,
+)
+
 # Add stablecoins to this tuple to monitor them.
-STABLECOINS = (USDM,)
+STABLECOINS = (USDM, USDCX, USDA)
