@@ -2,8 +2,9 @@
 
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -78,7 +79,7 @@ USDM = Stablecoin(
 )
 
 # Fixed rollout boundary: 2026-10-19 00:00 Europe/Istanbul. Never advances on restart.
-NEW_STABLECOINS_ACTIVATED_AT = int(datetime(2026, 10, 18, 21, tzinfo=UTC).timestamp())
+NEW_STABLECOINS_ACTIVATED_AT = int(datetime(2026, 10, 19, tzinfo=ZoneInfo("Europe/Istanbul")).timestamp())
 
 USDCX = Stablecoin(
     ticker="USDCx",

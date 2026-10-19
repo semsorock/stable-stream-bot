@@ -79,20 +79,8 @@ async def _process_block(block_hash: str) -> None:
     """Process a block for stablecoin mint/burn events."""
     logger.info(f"Processing block: {block_hash}")
 
-    # Filter before supply queries and media uploads, using exact smallest-unit amounts.
-    events = []
-    for event in await get_mints_for_block(block_hash):
-        if abs(event.quantity) < event.stablecoin.min_post_amount * 10**event.stablecoin.decimals:
-            logger.info(
-                "Skipping %s %s below %s-token threshold: tx=%s, quantity=%s",
-                event.stablecoin.ticker,
-                event.action,
-                event.stablecoin.min_post_amount,
-                event.tx_hash,
-                event.quantity,
-            )
-            continue
-        events.append(event)
+    # Detection applies activation and quantity rules before any supply or X calls.
+    events = await get_mints_for_block(block_hash)
 
     if not events:
         logger.info(f"No reportable stablecoin events in block {block_hash}")
@@ -102,27 +90,50 @@ async def _process_block(block_hash: str) -> None:
 
     # Get the current supply once for each stablecoin with reportable events.
     stablecoins = list(dict.fromkeys(event.stablecoin for event in events))
-    supplies = await asyncio.gather(*(get_total_supply(stablecoin.asset_id) for stablecoin in stablecoins))
-    supply_by_asset_id = dict(zip((stablecoin.asset_id for stablecoin in stablecoins), supplies, strict=True))
+    supplies = await asyncio.gather(
+        *(get_total_supply(stablecoin.asset_id) for stablecoin in stablecoins), return_exceptions=True
+    )
+    supply_by_asset_id = {}
+    for stablecoin, supply in zip(stablecoins, supplies, strict=True):
+        if isinstance(supply, Exception):
+            logger.error(
+                "Skipping %s events in block %s: supply lookup failed",
+                stablecoin.ticker,
+                block_hash,
+                exc_info=(type(supply), supply, supply.__traceback__),
+            )
+            continue
+        if isinstance(supply, BaseException):
+            raise supply
+        supply_by_asset_id[stablecoin.asset_id] = supply
 
     # Process each event
     for event in events:
+        if event.stablecoin.asset_id not in supply_by_asset_id:
+            continue
         logger.info(f"Processing {event.stablecoin.ticker} event: tx={event.tx_hash}, quantity={event.quantity}")
 
-        # Format and post tweet
-        supply = supply_by_asset_id[event.stablecoin.asset_id]
-        tweet_text = format_event_tweet(event, supply)
-        tweet_id = await asyncio.to_thread(
-            post_tweet,
-            tweet_text,
-            image_path=get_event_banner(event),
-            image_alt_text=f"{event.stablecoin.ticker} — {event.action.upper()}",
-        )
+        try:
+            supply = supply_by_asset_id[event.stablecoin.asset_id]
+            tweet_text = format_event_tweet(event, supply)
+            tweet_id = await asyncio.to_thread(
+                post_tweet,
+                tweet_text,
+                image_path=get_event_banner(event),
+                image_alt_text=f"{event.stablecoin.ticker} — {event.action.upper()}",
+            )
+        except Exception:
+            logger.exception(
+                "Failed processing %s event tx=%s; continuing with the remaining events",
+                event.stablecoin.ticker,
+                event.tx_hash,
+            )
+            continue
 
         if tweet_id:
             logger.info(f"Posted tweet {tweet_id} for tx {event.tx_hash}")
         else:
-            logger.info(f"Tweet not posted for tx {event.tx_hash}")
+            logger.info(f"No post confirmed for tx {event.tx_hash}")
 
 
 def _log_background_task_result(task: asyncio.Task[None]) -> None:

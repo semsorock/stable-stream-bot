@@ -1,8 +1,13 @@
 """Tests for the Blockfrost client cross-referencing logic."""
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from blockfrost import ApiError
+from requests.exceptions import ConnectionError, Timeout
+from tenacity import RetryError, wait_none
 
 import bot.blockfrost_client as bf_client
 from bot.config import NEW_STABLECOINS_ACTIVATED_AT, USDA, USDCX, USDM, Stablecoin
@@ -13,6 +18,10 @@ from bot.models import MintEvent
 def default_to_usdm(monkeypatch):
     """Keep existing single-token fixtures scoped to USDM."""
     monkeypatch.setattr(bf_client, "STABLECOINS", (USDM,))
+    bf_client._fetch_transaction_block_height.cache_clear()
+    monkeypatch.setattr(bf_client._fetch_block_metadata.retry, "wait", wait_none())
+    monkeypatch.setattr(bf_client._fetch_history_page.retry, "wait", wait_none())
+    monkeypatch.setattr(bf_client._fetch_transaction_block_height.__wrapped__.retry, "wait", wait_none())
 
 
 @pytest.mark.asyncio
@@ -22,7 +31,7 @@ async def test_get_mints_for_block_finds_mint_event(monkeypatch):
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx_abc", "action": "minted", "amount": 5_000_000}],
+        lambda _, block: [{"tx_hash": "tx_abc", "action": "minted", "amount": 5_000_000}],
     )
 
     events = await bf_client.get_mints_for_block("block-1")
@@ -39,7 +48,7 @@ async def test_get_mints_for_block_finds_burn_event(monkeypatch):
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx_burn", "action": "burned", "amount": -3_000_000}],
+        lambda _, block: [{"tx_hash": "tx_burn", "action": "burned", "amount": -3_000_000}],
     )
 
     events = await bf_client.get_mints_for_block("block-2")
@@ -56,7 +65,7 @@ async def test_get_mints_for_block_empty_when_no_match(monkeypatch):
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx_abc", "action": "minted", "amount": 1_000_000}],
+        lambda _, block: [{"tx_hash": "tx_abc", "action": "minted", "amount": 1_000_000}],
     )
 
     events = await bf_client.get_mints_for_block("block-3")
@@ -71,7 +80,7 @@ async def test_get_mints_for_block_multiple_events(monkeypatch):
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [
+        lambda _, block: [
             {"tx_hash": "tx_a", "action": "minted", "amount": 10_000_000},
             {"tx_hash": "tx_b", "action": "burned", "amount": -2_000_000},
             {"tx_hash": "tx_z", "action": "minted", "amount": 500_000},
@@ -107,7 +116,7 @@ async def test_get_mints_for_block_checks_each_configured_stablecoin(monkeypatch
 
     monkeypatch.setattr(bf_client, "STABLECOINS", (coin_a, coin_b))
     monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx_a", "tx_b"})
-    monkeypatch.setattr(bf_client, "_fetch_recent_mint_burns", histories.__getitem__)
+    monkeypatch.setattr(bf_client, "_fetch_recent_mint_burns", lambda asset_id, block: histories[asset_id])
 
     events = await bf_client.get_mints_for_block("block-multi")
 
@@ -126,9 +135,13 @@ async def test_new_token_activation_boundary(monkeypatch, stablecoin, action, am
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx-new", "action": action, "amount": amount}],
+        lambda _, block: [{"tx_hash": "tx-new", "action": action, "amount": amount}],
     )
-    monkeypatch.setattr(bf_client, "_fetch_block_timestamp", lambda _: NEW_STABLECOINS_ACTIVATED_AT + offset)
+    monkeypatch.setattr(
+        bf_client,
+        "_fetch_block_metadata",
+        lambda _: SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT + offset),
+    )
 
     events = await bf_client.get_mints_for_block("block-boundary")
 
@@ -151,7 +164,7 @@ async def test_replayed_old_block_uses_api_timestamp_and_preserves_usdm(monkeypa
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [
+        lambda _, block: [
             {
                 "tx_hash": "tx-old",
                 "action": "minted",
@@ -180,9 +193,9 @@ async def test_block_time_lookup_failure_suppresses_only_new_tokens(monkeypatch)
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx", "action": "burned", "amount": -10_000_000_000}],
+        lambda _, block: [{"tx_hash": "tx", "action": "burned", "amount": -10_000_000_000}],
     )
-    monkeypatch.setattr(bf_client, "_fetch_block_timestamp", fail)
+    monkeypatch.setattr(bf_client, "_fetch_block_metadata", fail)
 
     events = await bf_client.get_mints_for_block("block-unknown-time")
 
@@ -199,7 +212,7 @@ async def test_malformed_api_block_time_suppresses_new_tokens(monkeypatch, times
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx", "action": "minted", "amount": 10_000_000_000}],
+        lambda _, block: [{"tx_hash": "tx", "action": "minted", "amount": 10_000_000_000}],
     )
 
     assert await bf_client.get_mints_for_block("block-invalid-time") == []
@@ -212,14 +225,351 @@ async def test_usdm_does_not_require_block_time(monkeypatch):
     def unexpected(_):
         raise AssertionError("USDM must not need a timestamp")
 
-    monkeypatch.setattr(bf_client, "_fetch_block_timestamp", unexpected)
+    monkeypatch.setattr(bf_client, "_fetch_block_metadata", unexpected)
     monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
     monkeypatch.setattr(
         bf_client,
         "_fetch_recent_mint_burns",
-        lambda _: [{"tx_hash": "tx", "action": "minted", "amount": 1_000_000}],
+        lambda _, block: [{"tx_hash": "tx", "action": "minted", "amount": 1_000_000}],
     )
 
     events = await bf_client.get_mints_for_block("old-usdm-block")
 
     assert [event.stablecoin for event in events] == [USDM]
+
+
+@pytest.mark.parametrize("action,sign", [("minted", 1), ("burned", -1)])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.asyncio
+async def test_usdcx_minimum_uses_exact_base_units(monkeypatch, caplog, action, sign, offset):
+    """The inclusive 10,000-token floor must not round up a microtoken below it."""
+    caplog.set_level("INFO", logger="bot.blockfrost_client")
+    amount = sign * (10_000_000_000 + offset)
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDCX,))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
+    monkeypatch.setattr(
+        bf_client,
+        "_fetch_recent_mint_burns",
+        lambda _, block: [{"tx_hash": "tx", "action": action, "amount": amount}],
+    )
+    metadata = Mock(return_value=SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT))
+    monkeypatch.setattr(bf_client, "_fetch_block_metadata", metadata)
+
+    events = await bf_client.get_mints_for_block("block-threshold")
+
+    assert events == ([MintEvent("tx", action, amount, USDCX)] if offset >= 0 else [])
+    assert metadata.call_count == 1
+    if offset < 0:
+        assert f"Skipping USDCx {action} below 10000-token threshold: tx=tx, quantity={amount}" in caplog.text
+
+
+@pytest.mark.parametrize("stablecoin", [USDM, USDA], ids=lambda coin: coin.ticker)
+@pytest.mark.parametrize("action,amount", [("minted", 1), ("burned", -1)])
+@pytest.mark.asyncio
+async def test_other_tokens_have_no_amount_floor(monkeypatch, stablecoin, action, amount):
+    monkeypatch.setattr(bf_client, "STABLECOINS", (stablecoin,))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
+    monkeypatch.setattr(
+        bf_client,
+        "_fetch_recent_mint_burns",
+        lambda _, block: [{"tx_hash": "tx", "action": action, "amount": amount}],
+    )
+    monkeypatch.setattr(
+        bf_client, "_fetch_block_metadata", lambda _: SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT)
+    )
+
+    assert await bf_client.get_mints_for_block("block-tiny") == [MintEvent("tx", action, amount, stablecoin)]
+
+
+def api_error(status):
+    return ApiError(
+        SimpleNamespace(status_code=status, json=lambda: {"status_code": status, "error": "", "message": ""})
+    )
+
+
+@pytest.mark.parametrize("error", [api_error(502), Timeout("read timed out"), ConnectionError("connection reset")])
+@pytest.mark.asyncio
+async def test_transient_block_metadata_failure_recovers(monkeypatch, error):
+    metadata = Mock(side_effect=[error, SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT)])
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(block=metadata))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
+    monkeypatch.setattr(
+        bf_client,
+        "_fetch_recent_mint_burns",
+        lambda _, block: [{"tx_hash": "tx", "action": "minted", "amount": 10_000_000_000}],
+    )
+
+    events = await bf_client.get_mints_for_block("block-recovered")
+
+    assert [event.stablecoin for event in events] == [USDCX, USDA]
+    assert metadata.call_count == 2
+
+
+@pytest.mark.parametrize("error,attempts", [(api_error(502), 5), (Timeout("timed out"), 5), (api_error(403), 1)])
+@pytest.mark.asyncio
+async def test_metadata_failure_exhausts_retries_then_preserves_usdm(monkeypatch, error, attempts):
+    metadata = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(block=metadata))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
+    monkeypatch.setattr(
+        bf_client,
+        "_fetch_recent_mint_burns",
+        lambda _, block: [{"tx_hash": "tx", "action": "minted", "amount": 10_000_000_000}],
+    )
+
+    assert await bf_client.get_mints_for_block("block-unavailable") == [MintEvent("tx", "minted", 10_000_000_000, USDM)]
+    assert metadata.call_count == attempts
+
+
+def history_entry(tx_hash, action="minted", amount=1):
+    return SimpleNamespace(tx_hash=tx_hash, action=action, amount=str(amount))
+
+
+@pytest.mark.asyncio
+async def test_pagination_finds_large_mint_after_more_than_100_small_events(monkeypatch):
+    """Later bridge activity cannot evict a qualifying event from the target block."""
+    first_page = [history_entry(f"small-{i}") for i in range(100)]
+    second_page = [history_entry("small-100"), history_entry("large", amount=25_000_000_000)]
+    history = Mock(side_effect=[first_page, second_page])
+    api = SimpleNamespace(
+        asset_history=history,
+        block=Mock(return_value=SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT, height=100)),
+        transaction=Mock(return_value=SimpleNamespace(block_height=101)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDCX,))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"small-100", "large"})
+
+    events = await bf_client.get_mints_for_block("block-busy")
+
+    assert events == [MintEvent("large", "minted", 25_000_000_000, USDCX)]
+    assert [call.kwargs["page"] for call in history.call_args_list] == [1, 2]
+    assert all(call.kwargs["order"] == "desc" and call.kwargs["count"] == 100 for call in history.call_args_list)
+    api.block.assert_called_once_with("block-busy")
+    api.transaction.assert_called_once_with("small-99")
+
+
+def test_pagination_continues_through_multiple_pages_in_target_block(monkeypatch):
+    pages = [
+        [history_entry(f"tx-{i}") for i in range(100)],
+        [history_entry(f"tx-{i}") for i in range(100, 200)],
+        [history_entry("last")],
+    ]
+    api = SimpleNamespace(
+        asset_history=Mock(side_effect=pages),
+        block=Mock(return_value=SimpleNamespace(height=100)),
+        transaction=Mock(return_value=SimpleNamespace(block_height=100)),
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+
+    events = bf_client._fetch_recent_mint_burns(USDM.asset_id, bf_client._BlockMetadata("block"))
+
+    assert len(events) == 201
+    assert api.asset_history.call_count == 3
+    assert api.transaction.call_count == 2
+    api.block.assert_called_once_with("block")
+
+
+def test_pagination_stops_when_full_page_reaches_older_block(monkeypatch):
+    history = [history_entry("current"), *(history_entry(f"old-{i}") for i in range(99))]
+    api = SimpleNamespace(
+        asset_history=Mock(return_value=history),
+        block=Mock(return_value=SimpleNamespace(height=100)),
+        transaction=Mock(return_value=SimpleNamespace(block_height=99)),
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+
+    events = bf_client._fetch_recent_mint_burns(USDM.asset_id, bf_client._BlockMetadata("block"))
+
+    assert len(events) == 100
+    api.asset_history.assert_called_once_with(USDM.asset_id, order="desc", count=100, page=1)
+    api.transaction.assert_called_once_with("old-98")
+
+
+@pytest.mark.asyncio
+async def test_pagination_deduplicates_overlapping_pages(monkeypatch):
+    first_page = [history_entry(f"tx-{i}") for i in range(100)]
+    api = SimpleNamespace(
+        asset_history=Mock(side_effect=[first_page, [history_entry("tx-99"), history_entry("last")]]),
+        block=Mock(return_value=SimpleNamespace(height=100)),
+        transaction=Mock(return_value=SimpleNamespace(block_height=100)),
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx-99", "last"})
+
+    events = await bf_client.get_mints_for_block("block-overlap")
+
+    assert [event.tx_hash for event in events] == ["tx-99", "last"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_lookup_shared_across_concurrent_full_histories_and_activation(monkeypatch):
+    history = [history_entry("current", amount=10_000_000_000), *(history_entry(f"old-{i}") for i in range(99))]
+    api = SimpleNamespace(
+        asset_history=Mock(return_value=history),
+        block=Mock(return_value=SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT, height=100)),
+        transaction=Mock(return_value=SimpleNamespace(block_height=99)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"current"})
+
+    events = await bf_client.get_mints_for_block("block-shared")
+
+    assert [event.stablecoin for event in events] == [USDM, USDCX, USDA]
+    api.block.assert_called_once_with("block-shared")
+
+
+def test_page_boundary_height_is_cached_across_blocks(monkeypatch):
+    api = SimpleNamespace(
+        asset_history=Mock(return_value=[history_entry(f"old-{i}") for i in range(100)]),
+        block=Mock(side_effect=[SimpleNamespace(height=100), SimpleNamespace(height=101)]),
+        transaction=Mock(return_value=SimpleNamespace(block_height=99)),
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+
+    bf_client._fetch_recent_mint_burns(USDM.asset_id, bf_client._BlockMetadata("block-100"))
+    bf_client._fetch_recent_mint_burns(USDM.asset_id, bf_client._BlockMetadata("block-101"))
+
+    api.transaction.assert_called_once_with("old-99")
+    assert api.block.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_one_unavailable_history_does_not_drop_other_tokens(monkeypatch):
+    """An unreadable pagination boundary cannot discard unrelated USDM events."""
+    api = SimpleNamespace(
+        asset_history=Mock(
+            side_effect=lambda asset_id, **kwargs: (
+                [history_entry("usdm", amount=10_000_000_000)]
+                if asset_id == USDM.asset_id
+                else [history_entry(f"busy-{i}") for i in range(100)]
+            )
+        ),
+        block=Mock(side_effect=api_error(502)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"usdm"})
+
+    assert await bf_client.get_mints_for_block("block-partial") == [MintEvent("usdm", "minted", 10_000_000_000, USDM)]
+    assert api.block.call_count == 5
+
+
+@pytest.mark.parametrize("height", [None, True, -1, 123.45, "100"])
+def test_invalid_page_boundary_height_is_rejected(monkeypatch, height):
+    monkeypatch.setattr(
+        bf_client, "_get_api", lambda: SimpleNamespace(transaction=lambda _: SimpleNamespace(block_height=height))
+    )
+
+    with pytest.raises(ValueError, match="Invalid block height"):
+        bf_client._fetch_transaction_block_height("invalid")
+
+
+def test_shared_metadata_failure_is_not_retried_per_worker(monkeypatch):
+    metadata = Mock(side_effect=api_error(502))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(block=metadata))
+    block = bf_client._BlockMetadata("unavailable")
+
+    for lookup in (block.height, block.timestamp):
+        with pytest.raises(RetryError):
+            lookup()
+
+    assert metadata.call_count == 5
+
+
+@pytest.mark.asyncio
+async def test_pre_activation_replay_never_reads_new_token_histories(monkeypatch):
+    history = Mock(return_value=[history_entry("old-usdm", amount=1_000_000)])
+    api = SimpleNamespace(
+        asset_history=history,
+        block=Mock(return_value=SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT - 1, height=1)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"old-usdm"})
+
+    assert await bf_client.get_mints_for_block("old-block") == [MintEvent("old-usdm", "minted", 1_000_000, USDM)]
+    history.assert_called_once_with(USDM.asset_id, order="desc", count=100, page=1)
+
+
+@pytest.mark.parametrize("timestamp", [None, True, -1, NEW_STABLECOINS_ACTIVATED_AT - 1])
+@pytest.mark.asyncio
+async def test_inactive_tokens_do_not_query_any_history(monkeypatch, timestamp):
+    api = SimpleNamespace(
+        asset_history=Mock(),
+        block=Mock(return_value=SimpleNamespace(time=timestamp, height=1)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"old"})
+
+    assert await bf_client.get_mints_for_block("inactive-block") == []
+    api.asset_history.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_activation_metadata_retries_never_read_new_histories(monkeypatch):
+    api = SimpleNamespace(asset_history=Mock(), block=Mock(side_effect=Timeout("unavailable")))
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDCX, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"old"})
+
+    assert await bf_client.get_mints_for_block("unavailable-block") == []
+    assert api.block.call_count == 5
+    api.asset_history.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_history_cancellation_propagates(monkeypatch):
+    def cancelled(_asset_id, _block):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"tx"})
+    monkeypatch.setattr(bf_client, "_fetch_recent_mint_burns", cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bf_client.get_mints_for_block("cancelled-block")
+
+
+@pytest.mark.parametrize("failure", ["block-metadata", "boundary-transaction", "later-history-page"])
+@pytest.mark.asyncio
+async def test_incomplete_history_preserves_known_usdm_events(monkeypatch, caplog, failure):
+    history = Mock(return_value=[history_entry("known-usdm"), *(history_entry(f"other-{i}") for i in range(99))])
+    block = Mock(return_value=SimpleNamespace(height=100))
+    transaction = Mock(return_value=SimpleNamespace(block_height=100))
+    if failure == "block-metadata":
+        block.side_effect = api_error(502)
+    elif failure == "boundary-transaction":
+        transaction.side_effect = Timeout("boundary transaction unavailable")
+    else:
+        history.side_effect = [history.return_value, *(api_error(429) for _ in range(3))]
+    api = SimpleNamespace(asset_history=history, block=block, transaction=transaction)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"known-usdm"})
+
+    assert await bf_client.get_mints_for_block("partially-readable") == [MintEvent("known-usdm", "minted", 1, USDM)]
+    assert "history incomplete" in caplog.text
+    assert "retaining 100 collected events" in caplog.text
+    assert history.call_count == (4 if failure == "later-history-page" else 1)
+
+
+@pytest.mark.asyncio
+async def test_initial_history_failure_still_preserves_other_tokens(monkeypatch, caplog):
+    def history(asset_id, **_kwargs):
+        if asset_id == USDA.asset_id:
+            raise RuntimeError("USDA unavailable")
+        return [history_entry("known-usdm")]
+
+    api = SimpleNamespace(
+        asset_history=Mock(side_effect=history),
+        block=Mock(return_value=SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT)),
+    )
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDA))
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"known-usdm"})
+
+    assert await bf_client.get_mints_for_block("initial-failure") == [MintEvent("known-usdm", "minted", 1, USDM)]
+    assert "Cannot read USDA history" in caplog.text

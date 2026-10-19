@@ -1,6 +1,7 @@
 """Token identities and rollout configuration."""
 
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from bot.config import NEW_STABLECOINS_ACTIVATED_AT, STABLECOINS, USDA, USDCX, USDM
 
@@ -18,7 +19,15 @@ def test_stablecoin_registry():
 
 def test_new_token_rollout_is_fixed_istanbul_midnight():
     """Rollout never moves with wall clock time or application restarts."""
-    assert NEW_STABLECOINS_ACTIVATED_AT == int(datetime(2026, 10, 18, 21, tzinfo=UTC).timestamp())
+    rollout = datetime.fromtimestamp(NEW_STABLECOINS_ACTIVATED_AT, tz=ZoneInfo("Europe/Istanbul"))
+    assert (rollout.year, rollout.month, rollout.day, rollout.hour, rollout.minute, rollout.second) == (
+        2026,
+        10,
+        19,
+        0,
+        0,
+        0,
+    )
     assert all(coin.activation_timestamp == NEW_STABLECOINS_ACTIVATED_AT for coin in (USDCX, USDA))
     assert USDM.activation_timestamp is None
 

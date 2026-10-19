@@ -20,7 +20,9 @@ and USDA activate at **2026-10-19 00:00 Europe/Istanbul**
 (`2026-10-18T21:00:00Z`). Events from earlier blocks are suppressed, including
 replayed webhooks. The cutoff is fixed in config and does not change at midnight
 or on restart. USDM retains its existing behavior. Block time is verified using
-the Blockfrost API; if verification fails, new-token events are not posted.
+the Blockfrost API; timestamp lookup retries transient server and connection
+errors before failing closed for new-token events. The production `tzdata`
+dependency supplies timezone data when the base image has none.
 
 USDCx posts require at least **10,000 tokens** per mint or burn event, including
 exactly 10,000. Smaller events are skipped before supply lookup and posting.
@@ -46,8 +48,18 @@ STABLECOINS = (
 ```
 
 For every configured stablecoin, the bot monitors both mints and burns.
-New tokens also need two banner PNGs and a ticker entry in `bot/twitter/media.py`.
+New tokens need two 1200 × 400 PNGs named
+`bot/assets/banners/{ticker.lower()}-minted.png` and `-burned.png`; tickers must
+contain only ASCII letters and digits. No second runtime token registry needs
+updating. `tests/test_media.py` checks banners for every configured token.
+To regenerate artwork, add the source logo and renderer color as described below.
 Protocols with pre-minted reserves need a custom detector.
+
+Asset histories are fetched in 100-entry pages through the target block, so a
+burst of small events cannot hide a qualifying event beyond the first page.
+Pre-activation tokens are skipped before history lookup. If a later page or
+boundary lookup fails, collected events are retained and incomplete history is
+logged. Activation and amount filters run together before supply lookup.
 
 ### Post Images
 
@@ -55,12 +67,18 @@ Each post attaches one bundled **1200 × 400 PNG**, selected by token and action
 six images in `bot/assets/banners/` for the three tokens. Each shows the token's
 official registry logo and ticker, plus a vertical MINTED or BURNED label.
 The bot uploads the image and descriptive alt text using the existing OAuth
-credentials, then attaches its media ID to the post. Upload failures do not
-fall back to posts without images. With `TWEET_POSTING_ENABLED=false`, neither
+credentials, caches its media ID until X's upload expiry, then attaches it to
+the post. Repeated posts reuse the uploaded banner while it remains valid.
+Upload failures do not fall back to posts without images. Event processing is
+isolated: a missing banner or failed post logs that event and continues with
+other events in the block. A missing post ID is logged as an unknown outcome
+and is not automatically retried. With `TWEET_POSTING_ENABLED=false`, neither
 image uploads nor posts are sent.
 
 See [banner sources and regeneration](bot/assets/README.md) for artwork provenance
-and the optional development renderer. No image library is needed in production.
+and the optional `scripts/render_banners.py` development renderer. No image
+library is needed in production; source logos and fonts are excluded from the
+Docker context, leaving the six runtime banners.
 
 ## Prerequisites
 

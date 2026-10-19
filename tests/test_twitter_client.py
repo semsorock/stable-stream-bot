@@ -1,14 +1,21 @@
 """Verify X media requests using the real SDK and a mocked HTTP transport."""
 
 from base64 import b64decode
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from requests import HTTPError, Response
 from xdk import Client
 from xdk.oauth1_auth import OAuth1
 
 from bot.twitter import client as twitter
+
+
+@pytest.fixture(autouse=True)
+def isolated_media_cache(monkeypatch):
+    monkeypatch.setattr(twitter, "_media_cache", {})
 
 
 @pytest.fixture
@@ -26,6 +33,13 @@ def sdk(monkeypatch):
     monkeypatch.setattr(twitter, "_get_client", lambda: client)
     monkeypatch.setattr(twitter, "get_config", lambda: SimpleNamespace(tweet_posting_enabled=True))
     return client
+
+
+@pytest.fixture
+def banner(tmp_path):
+    image = tmp_path / "banner.png"
+    image.write_bytes(b"test-png-bytes")
+    return image
 
 
 def response(data):
@@ -116,8 +130,150 @@ def test_missing_image_prevents_any_api_call(sdk, tmp_path):
     sdk.session.post.assert_not_called()
 
 
-def test_missing_post_id_is_an_error(sdk):
-    sdk.session.post.return_value = response({"data": {}})
+def test_missing_post_id_has_unknown_outcome_and_is_not_retried(sdk, caplog):
+    sdk.session.post.return_value = response({"data": {}, "errors": [{"title": "partial response"}]})
 
-    with pytest.raises(RuntimeError, match="no post ID"):
-        twitter.post_tweet("text")
+    assert twitter.post_tweet("text") is None
+
+    assert sdk.session.post.call_count == 1
+    assert "outcome UNKNOWN" in caplog.text
+    assert "not retried" in caplog.text
+
+
+def test_cached_media_skips_upload_and_metadata(sdk, banner):
+    sdk.session.post.side_effect = [
+        response({"data": {"id": "media-123", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-123"}}),
+        response({"data": {"id": "tweet-123"}}),
+        response({"data": {"id": "tweet-456"}}),
+    ]
+
+    assert twitter.post_tweet("first", image_path=banner, image_alt_text="minted") == "tweet-123"
+    assert twitter.post_tweet("second", image_path=banner, image_alt_text="minted") == "tweet-456"
+
+    assert [call.args[0] for call in sdk.session.post.call_args_list] == [
+        "https://api.x.com/2/media/upload",
+        "https://api.x.com/2/media/metadata",
+        "https://api.x.com/2/tweets",
+        "https://api.x.com/2/tweets",
+    ]
+    assert sdk.session.post.call_args.kwargs["json"]["media"]["media_ids"] == ["media-123"]
+
+
+@pytest.mark.parametrize("clock_times", [(100, 101, 3671, 3672), (100, 3701, 3702, 3703)])
+def test_expired_media_is_refreshed_including_time_spent_uploading(sdk, banner, monkeypatch, clock_times):
+    monkeypatch.setattr(twitter, "monotonic", Mock(side_effect=clock_times))
+    sdk.session.post.side_effect = [
+        response({"data": {"id": "media-123", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-123"}}),
+        response({"data": {"id": "tweet-123"}}),
+        response({"data": {"id": "media-456", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-456"}}),
+        response({"data": {"id": "tweet-456"}}),
+    ]
+
+    assert twitter.post_tweet("first", image_path=banner, image_alt_text="minted") == "tweet-123"
+    assert twitter.post_tweet("second", image_path=banner, image_alt_text="minted") == "tweet-456"
+
+    assert sdk.session.post.call_count == 6
+    assert sdk.session.post.call_args.kwargs["json"]["media"]["media_ids"] == ["media-456"]
+
+
+@pytest.mark.parametrize("lifetime", [None, 0, -1, 30, True, "3600", float("nan"), float("inf"), 10**1000])
+def test_missing_or_invalid_media_expiry_is_not_cached(banner, lifetime):
+    upload = Mock(return_value={"data": {"id": "media-123", "expires_after_secs": lifetime}})
+    client = SimpleNamespace(media=SimpleNamespace(upload=upload))
+
+    assert twitter._upload_banner(client, banner, None) == "media-123"
+    assert twitter._upload_banner(client, banner, None) == "media-123"
+
+    assert upload.call_count == 2
+
+
+def test_metadata_failure_is_not_cached(sdk, banner):
+    sdk.session.post.side_effect = [
+        response({"data": {"id": "media-123", "expires_after_secs": 3600}}),
+        response({"errors": [{"title": "metadata failed"}]}),
+        response({"data": {"id": "media-456", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-456"}}),
+        response({"data": {"id": "tweet-456"}}),
+    ]
+
+    with pytest.raises(RuntimeError, match="alt text"):
+        twitter.post_tweet("first", image_path=banner, image_alt_text="minted")
+    assert twitter.post_tweet("second", image_path=banner, image_alt_text="minted") == "tweet-456"
+
+    assert sdk.session.post.call_count == 5
+    assert sdk.session.post.call_args.kwargs["json"]["media"]["media_ids"] == ["media-456"]
+
+
+def test_upload_partial_error_is_not_cached_or_posted(sdk, banner):
+    sdk.session.post.side_effect = [
+        response({"data": {"id": "media-123", "expires_after_secs": 3600}, "errors": [{"title": "rejected"}]}),
+        response({"data": {"id": "media-456", "expires_after_secs": 3600}}),
+        response({"data": {"id": "tweet-456"}}),
+    ]
+
+    with pytest.raises(RuntimeError, match="rejected banner upload"):
+        twitter.post_tweet("first", image_path=banner)
+    assert twitter.post_tweet("second", image_path=banner) == "tweet-456"
+
+    assert sdk.session.post.call_count == 3
+
+
+@pytest.mark.parametrize("change", ["path", "alt_text"])
+def test_media_cache_distinguishes_banner_path_and_alt_text(sdk, banner, change):
+    second_image = banner.with_name("other.png")
+    second_image.write_bytes(b"other-png-bytes")
+    sdk.session.post.side_effect = [
+        response({"data": {"id": "media-123", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-123"}}),
+        response({"data": {"id": "tweet-123"}}),
+        response({"data": {"id": "media-456", "expires_after_secs": 3600}}),
+        response({"data": {"id": "media-456"}}),
+        response({"data": {"id": "tweet-456"}}),
+    ]
+
+    twitter.post_tweet("first", image_path=banner, image_alt_text="minted")
+    twitter.post_tweet(
+        "second",
+        image_path=second_image if change == "path" else banner,
+        image_alt_text="burned" if change == "alt_text" else "minted",
+    )
+
+    assert sdk.session.post.call_count == 6
+
+
+def test_cache_serializes_concurrent_banner_uploads(banner):
+    upload = Mock(return_value={"data": {"id": "media-123", "expires_after_secs": 3600}})
+    metadata = Mock(return_value={})
+    client = SimpleNamespace(media=SimpleNamespace(upload=upload, create_metadata=metadata))
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        ids = list(executor.map(lambda _: twitter._upload_banner(client, banner, "minted"), range(8)))
+
+    assert ids == ["media-123"] * 8
+    upload.assert_called_once()
+    metadata.assert_called_once()
+
+
+@pytest.mark.parametrize("endpoint", ["upload", "metadata"])
+def test_http_error_logs_bounded_x_error_body(sdk, banner, caplog, endpoint):
+    failed_response = Response()
+    failed_response.status_code = 403
+    failed_response._content = ('{"detail":"media.write permission missing"}' + "x" * 3000 + "SECRET-TAIL").encode()
+    failure = response({})
+    failure.raise_for_status.side_effect = HTTPError("403 Client Error", response=failed_response)
+    sdk.session.post.side_effect = (
+        [failure]
+        if endpoint == "upload"
+        else [response({"data": {"id": "media-123", "expires_after_secs": 3600}}), failure]
+    )
+
+    with pytest.raises(HTTPError):
+        twitter.post_tweet("text", image_path=banner, image_alt_text="minted")
+
+    assert "X HTTP 403" in caplog.text
+    assert "media.write permission missing" in caplog.text
+    assert "SECRET-TAIL" not in caplog.text
+    assert not twitter._media_cache
