@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import ssl
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from functools import lru_cache
@@ -45,10 +46,32 @@ def shutdown_reads() -> None:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _is_tls_eof(exc: SSLError) -> bool:
+    """Recognize requests/urllib3-wrapped TLS EOFs, never certificate failures."""
+    pending = [exc]
+    seen = set()
+    eof = False
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(error):
+            return False
+        eof |= isinstance(error, ssl.SSLEOFError) or "[SSL: UNEXPECTED_EOF_WHILE_READING]" in str(error)
+        # urllib3 stores its wrapped error in reason/args; explicit causes may wrap it too.
+        # Do not follow __context__: an unrelated, previously handled EOF is not this failure.
+        nested = (*error.args, getattr(error, "reason", None), error.__cause__)
+        pending.extend(value for value in nested if isinstance(value, BaseException))
+    return eof
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     """Retry safe reads on transport failures, rate limits, and server errors."""
-    if isinstance(exc, (SSLError, ProxyError)):
-        return False  # Local TLS or proxy misconfiguration: surface it at once instead of burning the budget.
+    if isinstance(exc, ProxyError):
+        return False
+    if isinstance(exc, SSLError):
+        return _is_tls_eof(exc)
     return isinstance(exc, (ConnectionError, Timeout, ChunkedEncodingError)) or (
         isinstance(exc, ApiError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
     )

@@ -1,6 +1,7 @@
 """Tests for the Blockfrost client cross-referencing logic."""
 
 import asyncio
+import ssl
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from http.client import RemoteDisconnected
@@ -12,6 +13,8 @@ import pytest
 from blockfrost import ApiError
 from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, SSLError, Timeout
 from tenacity import RetryError, Retrying, wait_none
+from urllib3.exceptions import MaxRetryError
+from urllib3.exceptions import SSLError as Urllib3SSLError
 
 import bot.blockfrost_client as bf_client
 from bot.config import NEW_STABLECOINS_ACTIVATED_AT, USDA, USDCX, USDM, Stablecoin
@@ -301,6 +304,16 @@ def api_error(status):
     )
 
 
+def tls_eof_error(legacy=False):
+    """Match both wrapped TLS EOF variants observed in Cloud Run logs."""
+    reason = (
+        ssl.SSLError(5, "[SSL: UNEXPECTED_EOF_WHILE_READING] unexpected eof while reading")
+        if legacy
+        else ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+    )
+    return SSLError(MaxRetryError(None, "/api/v0/assets/asset/history", reason=Urllib3SSLError(reason)))
+
+
 _READ_CASES = [
     pytest.param("_fetch_history_page", "asset_history", ("asset", 2), [], [], 5, False, id="history-page"),
     pytest.param(
@@ -336,13 +349,27 @@ _READ_CASES = [
     [
         ConnectionError("Connection aborted.", RemoteDisconnected("Remote end closed connection without response")),
         ChunkedEncodingError("Response ended prematurely"),
+        tls_eof_error(),
+        tls_eof_error(legacy=True),
+        SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] unexpected eof while reading"),
         Timeout("read timed out"),
         api_error(429),
         api_error(500),
         api_error(502),
         api_error(503),
     ],
-    ids=["remote-disconnected", "mid-body-disconnect", "timeout", "429", "500", "502", "503"],
+    ids=[
+        "remote-disconnected",
+        "mid-body-disconnect",
+        "tls-eof",
+        "legacy-tls-eof",
+        "flattened-tls-eof",
+        "timeout",
+        "429",
+        "500",
+        "502",
+        "503",
+    ],
 )
 def test_blockfrost_reads_retry_transient_failures(
     monkeypatch, caplog, fetcher, method, args, response, expected, attempts, retry_404, error
@@ -360,7 +387,14 @@ def test_blockfrost_reads_retry_transient_failures(
 
 @pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
 @pytest.mark.parametrize(
-    "error", [ConnectionError("closed"), ChunkedEncodingError("truncated"), Timeout("timed out"), api_error(502)]
+    "error",
+    [
+        ConnectionError("closed"),
+        ChunkedEncodingError("truncated"),
+        Timeout("timed out"),
+        api_error(502),
+        tls_eof_error(),
+    ],
 )
 def test_blockfrost_read_retries_are_bounded(
     monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, error
@@ -394,8 +428,23 @@ def test_blockfrost_reads_do_not_retry_permanent_errors(
 @pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
 @pytest.mark.parametrize(
     "error",
-    [SSLError("certificate verify failed"), ProxyError("407 Proxy Authentication Required")],
-    ids=["tls", "proxy"],
+    [
+        SSLError("certificate verify failed"),
+        SSLError(
+            MaxRetryError(
+                None,
+                "/",
+                reason=Urllib3SSLError(
+                    ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] hostname mismatch"),
+                ),
+            )
+        ),
+        SSLError(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")),
+        SSLError("unknown TLS failure"),
+        ProxyError("407 Proxy Authentication Required"),
+        ProxyError(tls_eof_error()),
+    ],
+    ids=["tls", "wrapped-certificate", "wrong-tls-version", "unknown-tls", "proxy", "proxy-tls-eof"],
 )
 def test_blockfrost_reads_do_not_retry_local_transport_misconfiguration(
     monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, error
@@ -409,6 +458,56 @@ def test_blockfrost_reads_do_not_retry_local_transport_misconfiguration(
 
     assert failure.value is error
     request.assert_called_once()
+
+
+def test_certificate_failure_takes_priority_over_wrapped_eof():
+    error = tls_eof_error()
+    error.__cause__ = ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+    assert not bf_client._is_transient_error(error)
+
+
+def test_tls_eof_in_explicit_cause_is_retryable():
+    error = SSLError("TLS handshake closed")
+    error.__cause__ = ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+
+    assert bf_client._is_transient_error(error)
+
+
+def test_tls_eof_classifier_ignores_unrelated_context_and_handles_cycles():
+    error = SSLError("unknown TLS failure")
+    error.__context__ = tls_eof_error()
+    error.__cause__ = error
+
+    assert not bf_client._is_transient_error(error)
+
+
+@pytest.mark.parametrize("action,sign", [("minted", 1), ("burned", -1)])
+@pytest.mark.asyncio
+async def test_tls_eof_recovery_keeps_usdm_and_other_tokens(monkeypatch, caplog, action, sign):
+    calls = []
+
+    def history(asset_id, **kwargs):
+        calls.append(asset_id)
+        if asset_id == USDM.asset_id and calls.count(asset_id) == 1:
+            raise tls_eof_error()
+        return [SimpleNamespace(tx_hash="event", action=action, amount=str(sign * 10_000_000_000))]
+
+    monkeypatch.setattr(bf_client, "STABLECOINS", (USDM, USDCX, USDA))
+    api = SimpleNamespace(
+        asset_history=history,
+        block=lambda _: SimpleNamespace(time=NEW_STABLECOINS_ACTIVATED_AT, height=100),
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: api)
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"event"})
+
+    events = await bf_client.get_mints_for_block("tls-recovery-block")
+
+    assert [event.stablecoin for event in events] == [USDM, USDCX, USDA]
+    assert all(event.quantity == sign * 10_000_000_000 and event.action == action for event in events)
+    assert calls.count(USDM.asset_id) == 2
+    assert calls.count(USDCX.asset_id) == calls.count(USDA.asset_id) == 1
+    assert "Cannot read USDM history" not in caplog.text
 
 
 @pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
