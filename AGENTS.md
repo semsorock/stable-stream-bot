@@ -2,7 +2,7 @@
 
 ## Project Purpose
 
-This is a **Cardano stablecoin monitoring bot** that watches for mint/burn transactions and posts summaries to Twitter/X. USDM is configured by default, and additional stablecoins can be added in `bot/config.py`. It's deployed as a Google Cloud Run service (FastAPI + uvicorn) triggered by Blockfrost block webhooks (`POST /`).
+This is a **Cardano stablecoin monitoring bot** that watches USDM, USDCx, and USDA mint/burn transactions and posts summaries with token banners to Twitter/X. Stablecoins are configured in `bot/config.py`. It's deployed as a Google Cloud Run service (FastAPI + uvicorn) triggered by Blockfrost block webhooks (`POST /`).
 
 USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad`).
 
@@ -13,7 +13,8 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 1. **Blockfrost webhook** → Cloud Run `/` endpoint
 2. **Acknowledge the webhook quickly** to keep request latency low
 3. **Query Blockfrost API** in background for configured stablecoin mint/burn transactions in the block
-4. **Post tweets** via X API (XDK) with quantity, supply, and Cardano Explorer link
+4. **Filter events** by each token's fixed activation timestamp and minimum post amount
+5. **Post tweets** via X API (XDK) with quantity, supply, Cardano Explorer link, and a token/action banner
 
 ### Project Structure
 
@@ -22,6 +23,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 ├── bot/
 │   ├── __init__.py
 │   ├── config.py                # Centralised config (.env via dotenv), validation + feature flags
+│   ├── assets/                  # Runtime banners; development logos/fonts and provenance
 │   ├── logging.py               # Logging setup (setup_logging, get_logger)
 │   ├── models.py                # Dataclasses: MintEvent
 │   ├── links.py                 # External link builders (Cardano Explorer)
@@ -32,7 +34,9 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 │       ├── __init__.py
 │       ├── client.py            # XDK wrapper with TWEET_POSTING_ENABLED gate
 │       ├── formatter.py         # Tweet text builders for mint/burn events
+│       ├── media.py             # Token/action banner path selection
 │       └── templates.py         # Editable tweet text templates
+├── scripts/render_banners.py    # Optional Pillow development renderer
 ├── tests/                       # Pytest test suite
 ├── .github/workflows/ci.yml     # CI pipeline (ruff + pytest)
 ├── .env.example                 # Template for required env vars
@@ -44,18 +48,21 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 ### Key Components
 
-- `bot/config.py`: All env vars loaded into a frozen `Config` dataclass via `python-dotenv` (`.env` overrides system vars). Includes feature flags.
+- `bot/config.py`: All env vars loaded into a frozen `Config` dataclass via `python-dotenv` (`.env` overrides system vars). `Stablecoin` defines asset identity, decimals, `activation_timestamp`, and `min_post_amount` in whole tokens.
 
 - `bot/models.py`: Typed dataclasses for all domain objects:
   - `MintEvent`: Stablecoin mint/burn transaction data
 
 - `bot/blockfrost_client.py`: Async functions that query the Blockfrost API. Uses a stateless cross-referencing algorithm for each configured stablecoin:
   1. Get block transactions via `api.block_transactions()`
-  2. Get recent stablecoin mint/burn history via `api.asset_history()`
+  2. Page stablecoin mint/burn histories via `api.asset_history()` through the target block
   3. Cross-reference to find events in the current block
-  4. Get total supply via `api.asset()` for stablecoins with events
+  4. Filter events for posting eligibility before supply lookup
+  5. Get total supply via `api.asset()` for stablecoins with reportable events
 
-- `bot/twitter/client.py`: `post_tweet()` via XDK — logs content and only posts when `TWEET_POSTING_ENABLED=true`.
+- `bot/twitter/client.py`: `post_tweet()` via XDK — logs content and only posts when `TWEET_POSTING_ENABLED=true`. Uploads the banner and alt text, caches its media ID until X's expiry, and attaches it to the post. Dry-run sends no X requests. Missing post IDs have an unknown outcome and are not automatically retried.
+
+- `bot/twitter/media.py`: Derives `bot/assets/banners/{ticker.lower()}-{action}.png` from the event, checks that the file exists, and requires an ASCII alphanumeric ticker. There is no separate runtime token registry.
 
 - `bot/twitter/formatter.py`: Pure functions that build tweet text strings:
   - `format_mint_tweet()`: Stablecoin mint event
@@ -68,7 +75,7 @@ USDM is Mehen's fiat-backed USD stablecoin on Cardano (policy ID: `c48cbb3d5e57e
 
 - `bot/links.py`: URL builders for Cardano Explorer.
 
-- `bot/main.py`: FastAPI `app` instance with a fast-ack `POST /` webhook handler that continues block processing asynchronously in-process.
+- `bot/main.py`: FastAPI `app` instance with a fast-ack `POST /` webhook handler that continues block processing asynchronously in-process. Each event has its own error boundary; a missing banner or failed post logs the event and processing continues.
 
 - `bot/logging.py`: `setup_logging()` + `get_logger()` — stdlib logging, structured for Cloud Run.
 
@@ -79,11 +86,19 @@ The bot queries the **Blockfrost API** (via `blockfrost-python` SDK) to detect c
 ### Detection Algorithm (per block)
 
 1. `api.block_transactions(block_hash)` → set of tx hashes in the block
-2. For every entry in `STABLECOINS`, call `api.asset_history(asset_id, order='desc', count=100)`
+2. Skip activation-ineligible tokens before history lookup; for eligible entries in `STABLECOINS`, page `api.asset_history(asset_id, order='desc', count=100)` through the target block; 100 is a page size, not a total history limit
 3. Cross-reference each history with the block transaction hashes
-4. `api.asset(asset_id).quantity` → current total supply for each stablecoin with events
+4. Apply activation and amount filters before supply lookup
+5. `api.asset(asset_id).quantity` → current total supply for each stablecoin with reportable events
 
-USDM mints are infrequent (~1-2/day), so 100 history entries covers weeks. Revisit this fixed history window before configuring a high-activity asset.
+History pagination prevents bursts of small USDCx events from hiding a reportable event beyond the first page. A fixed 100-entry history window is insufficient for a high-activity asset.
+
+### Posting Eligibility
+
+- USDCx and USDA have a fixed rollout boundary: **2026-10-19 00:00 Europe/Istanbul**. Earlier blocks, including replayed webhooks, are suppressed. Never replace this with a moving `today()` cutoff.
+- Blockfrost block metadata verifies the timestamp. Verification fails closed for activation-gated tokens after retries are exhausted; USDM has no activation cutoff.
+- USDCx requires `abs(quantity) >= 10_000 * 10**decimals`; both mint and burn amounts include exactly 10,000 tokens. USDM and USDA have no amount floor.
+- All configured tokens use six decimals. DJED is not monitored.
 
 **USDM Asset ID**: `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d` (policy ID + CIP-68 label 333 `0014df10` + hex "USDM")
 
@@ -99,7 +114,9 @@ The bot generates links to Cardano Explorer via `bot/links.py`:
 
 ### Error Handling & Resilience
 
-- Uses `tenacity` with exponential backoff: five attempts for block transaction lookup on Blockfrost 404/429 responses, and three attempts for other rate-limited calls
+- Uses `tenacity` with exponential backoff: five attempts for block transaction lookup on Blockfrost 404/429 responses, and three attempts for other rate-limited calls. Block metadata and history-boundary transaction lookups make five attempts for 404/429, transient 5xx, timeouts, and connection errors.
+
+- Metadata (timestamp and height) is shared within each block request. Activation-gated tokens verify time before history lookup, avoiding lifetime scans on old replays. A bounded cache of boundary transaction heights avoids repeat calls for quiet tokens. Later-page or boundary failures retain collected history and explicitly log that history is incomplete; initial history failures and individual event failures leave other tokens/events processing. Cancellation propagates.
 
 - Blockfrost SDK calls are synchronous, wrapped in `asyncio.to_thread()` for async compatibility
 
@@ -198,6 +215,13 @@ Set environment variables, then POST a Blockfrost block-event JSON payload to `/
 
 4. Add orchestration in `bot/main.py`
 
+### Adding a Stablecoin
+
+1. Add a `Stablecoin` to `STABLECOINS` in `bot/config.py` with its authentic full asset ID and decimals. Choose a fixed activation timestamp and optional whole-token `min_post_amount`.
+2. Add `bot/assets/banners/{ticker.lower()}-minted.png` and `-burned.png` (1200 × 400 PNGs). `tests/test_media.py` checks every configured token automatically. No change to `bot/twitter/media.py` is needed.
+3. To use the renderer, add the token logo to `bot/assets/logos/` and its color to `scripts/render_banners.py`'s `TOKENS`, then run `uv run --with pillow python scripts/render_banners.py`. Record provenance in `bot/assets/README.md`.
+4. The production Docker context excludes source logos and fonts; it includes the generated banners. Protocols with pre-minted reserves need a custom detector.
+
 ### Changing Tweet Format
 
 - Modify formatter functions in `bot/twitter/formatter.py`
@@ -205,6 +229,8 @@ Set environment variables, then POST a Blockfrost block-event JSON payload to `/
 - Keep under 280 characters (Twitter limit not enforced in code)
 
 - Use emoji consistently: 💵 (mint), 🔥 (burn), 🔗 (links)
+
+- Templates contain no hashtags. Each post uses the matching token/action banner; an upload failure does not fall back to a text-only post.
 
 ## Dependencies Summary
 
@@ -218,6 +244,7 @@ xdk>=0.8.1                  # X API SDK (OAuth 1.0a + posts client)
 blockfrost-python>=0.7,<1   # Blockfrost API SDK
 tenacity>=9,<10             # Retry/backoff decorator
 python-dotenv>=1.2.1        # .env file loading
+tzdata>=2025.2              # ZoneInfo fallback for slim images without system timezone data
 # Dev
 pytest>=8                   # Test runner
 pytest-asyncio>=0.25        # Async test support (asyncio_mode = "auto")

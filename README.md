@@ -1,6 +1,6 @@
 # Stable Stream Bot
 
-A Cardano monitoring bot that watches configured stablecoins for mint and burn transactions and posts summaries to Twitter/X. USDM is configured by default.
+A Cardano monitoring bot that watches USDM, USDCx, and USDA for mint and burn transactions and posts summaries with token banners to Twitter/X.
 
 ## How It Works
 
@@ -11,30 +11,74 @@ Blockfrost Webhook (POST /) → FastAPI on Cloud Run → Immediate ack → Block
 1. **Blockfrost** sends block webhooks to `/`
 2. The bot acknowledges the webhook quickly to keep request latency low
 3. Background processing queries the **Blockfrost API** for configured stablecoin mint/burn events in that block
-4. Formatted summaries are posted to **Twitter/X** via `xdk`
+4. Summaries without hashtags are posted to **Twitter/X** via `xdk`, with a token-specific mint or burn banner
 
 ### Stablecoin Configuration
 
-Stablecoins are configured in `bot/config.py`. USDM is included by default. Add another `Stablecoin` entry to the `STABLECOINS` tuple with its ticker, policy ID, full Blockfrost asset ID, and decimal count:
+Stablecoins are configured in `bot/config.py`. All three use six decimals. USDCx
+and USDA activate at **2026-10-19 00:00 Europe/Istanbul**
+(`2026-10-18T21:00:00Z`). Events from earlier blocks are suppressed, including
+replayed webhooks. The cutoff is fixed in config and does not change at midnight
+or on restart. USDM retains its existing behavior. Block time is verified using
+the Blockfrost API; timestamp lookup retries transient server and connection
+errors before failing closed for new-token events. The production `tzdata`
+dependency supplies timezone data when the base image has none.
+
+USDCx posts require at least **10,000 tokens** per mint or burn event, including
+exactly 10,000. Smaller events are skipped before supply lookup and posting.
+Adjust `USDCX.min_post_amount` in `bot/config.py` to change the threshold; its
+value is in whole tokens. USDM and USDA have no minimum post amount.
+
+Add another `Stablecoin` entry to the `STABLECOINS` tuple with its ticker,
+policy ID, full Blockfrost asset ID, decimal count, and a fixed activation
+timestamp when historical events should be excluded:
 
 ```python
 STABLECOINS = (
-    Stablecoin(
-        ticker="USDM",
-        policy_id="...",
-        asset_id="...",
-        decimals=6,
-    ),
+    USDM, USDCX, USDA,
     Stablecoin(
         ticker="ANOTHER",
         policy_id="...",
         asset_id="...",
         decimals=6,
+        activation_timestamp=1792357200,  # Choose a fixed rollout date
+        min_post_amount=0,  # Optional minimum in whole tokens, for mints and burns
     ),
 )
 ```
 
 For every configured stablecoin, the bot monitors both mints and burns.
+New tokens need two 1200 × 400 PNGs named
+`bot/assets/banners/{ticker.lower()}-minted.png` and `-burned.png`; tickers must
+contain only ASCII letters and digits. No second runtime token registry needs
+updating. `tests/test_media.py` checks banners for every configured token.
+To regenerate artwork, add the source logo and renderer color as described below.
+Protocols with pre-minted reserves need a custom detector.
+
+Asset histories are fetched in 100-entry pages through the target block, so a
+burst of small events cannot hide a qualifying event beyond the first page.
+Pre-activation tokens are skipped before history lookup. If a later page or
+boundary lookup fails, collected events are retained and incomplete history is
+logged. Activation and amount filters run together before supply lookup.
+
+### Post Images
+
+Each post attaches one bundled **1200 × 400 PNG**, selected by token and action:
+six images in `bot/assets/banners/` for the three tokens. Each shows the token's
+official registry logo and ticker, plus a vertical MINTED or BURNED label.
+The bot uploads the image and descriptive alt text using the existing OAuth
+credentials, caches its media ID until X's upload expiry, then attaches it to
+the post. Repeated posts reuse the uploaded banner while it remains valid.
+Upload failures do not fall back to posts without images. Event processing is
+isolated: a missing banner or failed post logs that event and continues with
+other events in the block. A missing post ID is logged as an unknown outcome
+and is not automatically retried. With `TWEET_POSTING_ENABLED=false`, neither
+image uploads nor posts are sent.
+
+See [banner sources and regeneration](bot/assets/README.md) for artwork provenance
+and the optional `scripts/render_banners.py` development renderer. No image
+library is needed in production; source logos and fonts are excluded from the
+Docker context, leaving the six runtime banners.
 
 ## Prerequisites
 
@@ -136,6 +180,7 @@ Every push to the `main` branch automatically triggers:
 ├── main.py                      # Entry point shim (re-exports FastAPI app)
 ├── bot/
 │   ├── config.py                # Environment and monitored stablecoin config
+│   ├── assets/                  # Bundled token logos and mint/burn banners
 │   ├── links.py                 # External link builders (Cardano Explorer)
 │   ├── logging.py               # Structured logging setup
 │   ├── main.py                  # FastAPI app + fast-ack webhook handler
@@ -145,6 +190,7 @@ Every push to the `main` branch automatically triggers:
 │   └── twitter/
 │       ├── client.py            # XDK posting client
 │       ├── formatter.py         # Tweet composition logic
+│       ├── media.py             # Token/action banner selection
 │       └── templates.py         # Editable tweet templates
 ├── tests/                       # Pytest test suite
 ├── pyproject.toml               # Dependency/tool config

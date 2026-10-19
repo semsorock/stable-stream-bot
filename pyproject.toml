@@ -16,6 +16,7 @@ dependencies = [
     "blockfrost-python>=0.7,<1",
     "tenacity>=9,<10",
     "python-dotenv>=1.2.1",
+    "tzdata>=2025.2",
     "xdk>=0.8.1",
 ]
 
@@ -30,6 +31,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["bot*"]
 exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+bot = ["assets/banners/*.png"]
 
 [tool.ruff]
 line-length = 120

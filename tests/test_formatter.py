@@ -2,7 +2,7 @@
 
 import pytest
 
-from bot.config import USDM, Stablecoin
+from bot.config import STABLECOINS, USDM, Stablecoin
 from bot.models import MintEvent
 from bot.twitter.formatter import format_event_tweet
 
@@ -34,6 +34,20 @@ def test_format_burn_tweet():
     assert "500,000.00" in tweet
     assert "49,500,000.00" in tweet
     assert "def456" in tweet
+
+
+@pytest.mark.parametrize("stablecoin", STABLECOINS, ids=lambda coin: coin.ticker)
+@pytest.mark.parametrize(("action", "quantity"), [("minted", 1_000_000), ("burned", -1_000_000)])
+def test_all_post_templates_have_no_hashtags(stablecoin, action, quantity):
+    event = MintEvent(tx_hash="a" * 64, action=action, quantity=quantity, stablecoin=stablecoin)
+
+    tweet = format_event_tweet(event, supply=10_000_000)
+
+    assert "#" not in tweet
+    assert f"${stablecoin.ticker}" in tweet
+    assert action.upper() in tweet
+    assert tweet.endswith("a" * 64)
+    assert len(tweet) <= 280
 
 
 def test_format_tweet_uses_configured_ticker_and_decimals():

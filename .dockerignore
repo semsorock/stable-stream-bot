@@ -15,5 +15,7 @@ __pycache__
 dist
 build
 tests
+bot/assets/fonts
+bot/assets/logos
 *.md
 !README.md
