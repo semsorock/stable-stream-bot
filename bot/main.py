@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .blockfrost_client import get_mints_for_block, get_total_supply
+from .blockfrost_client import get_mints_for_block, get_total_supply, shutdown_reads
 from .logging import get_logger, setup_logging
 from .twitter.client import post_tweet
 from .twitter.formatter import format_event_tweet
@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Stable Stream Bot")
     yield
     logger.info("Shutting down Stable Stream Bot")
+    shutdown_reads()
 
 
 app = FastAPI(title="Stable Stream Bot", lifespan=lifespan)

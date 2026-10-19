@@ -4,37 +4,83 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from functools import lru_cache, partial
+from functools import lru_cache
 from threading import Lock
 
 from blockfrost import ApiError
-from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
-from tenacity import RetryCallState, Retrying, retry_if_exception, stop_after_attempt, wait_random_exponential
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, SSLError, Timeout
+from tenacity import (
+    RetryCallState,
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_combine,
+    wait_exponential,
+    wait_random,
+    wait_random_exponential,
+)
 
-from .blockfrost_transport import TimeoutBlockFrostApi
+from .blockfrost_transport import POOL_SIZE, TimeoutBlockFrostApi
 from .config import STABLECOINS, Stablecoin, get_config
 from .logging import get_logger
 from .models import MintEvent
 
 logger = get_logger(__name__)
-_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="blockfrost")
+_executor: ThreadPoolExecutor | None = None
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """Create the Blockfrost read pool on first use so a shutdown pool is never reused."""
+    global _executor
+    if _executor is None:
+        _executor = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="blockfrost")
+    return _executor
+
+
+def shutdown_reads() -> None:
+    """Drop reads still queued at shutdown; their blocks will not be posted once the process is gone."""
+    global _executor
+    executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _is_transient_error(exc: BaseException) -> bool:
     """Retry safe reads on transport failures, rate limits, and server errors."""
+    if isinstance(exc, (SSLError, ProxyError)):
+        return False  # Local TLS or proxy misconfiguration: surface it at once instead of burning the budget.
     return isinstance(exc, (ConnectionError, Timeout, ChunkedEncodingError)) or (
         isinstance(exc, ApiError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
     )
 
 
+def _is_indexing_lag(exc: BaseException) -> bool:
+    """Blockfrost returns 404 for a block its webhook announced before its API indexed it."""
+    return isinstance(exc, ApiError) and exc.status_code == 404
+
+
 def _is_transient_or_not_found(exc: BaseException) -> bool:
     """Block-related reads also tolerate delayed Blockfrost indexing."""
-    return _is_transient_error(exc) or (isinstance(exc, ApiError) and exc.status_code == 404)
+    return _is_transient_error(exc) or _is_indexing_lag(exc)
+
+
+# Contention with the other reads of the same block on Blockfrost's rate limiter: full jitter spreads retries.
+_CONTENTION_WAIT = wait_random_exponential(multiplier=2, min=1, max=8)
+# Waiting for Blockfrost to index a fresh block: a fixed 2+2+4+8s schedule that jitter can only lengthen,
+# so an unindexed block always gets at least 16 seconds before the final attempt.
+_INDEXING_WAIT = wait_combine(wait_exponential(min=2, max=8), wait_random(0, 1))
+
+
+def _wait_for_read(state: RetryCallState) -> float:
+    """Choose the wait by cause: indexing lag needs a floor, everything else needs spread."""
+    if _is_indexing_lag(state.outcome.exception()):
+        return _INDEXING_WAIT(state)
+    return _CONTENTION_WAIT(state)
 
 
 def _log_retry(state: RetryCallState) -> None:
     error = state.outcome.exception()
-    level = logging.INFO if isinstance(error, ApiError) and error.status_code == 404 else logging.WARNING
+    level = logging.INFO if _is_indexing_lag(error) else logging.WARNING
     logger.log(
         level,
         "Retrying %s in %.2fs after attempt %s: %s",
@@ -46,12 +92,18 @@ def _log_retry(state: RetryCallState) -> None:
 
 
 def _read_retry(predicate):
-    return Retrying(
-        stop=stop_after_attempt(5),
-        wait=wait_random_exponential(multiplier=2, min=1, max=8),
-        retry=retry_if_exception(predicate),
-        before_sleep=_log_retry,
-    ).wraps
+    """Give each decorated read its own five-attempt policy; nothing is shared between reads."""
+
+    def decorate(function):
+        policy = Retrying(
+            stop=stop_after_attempt(5),
+            wait=_wait_for_read,
+            retry=retry_if_exception(predicate),
+            before_sleep=_log_retry,
+        )
+        return policy.wraps(function)
+
+    return decorate
 
 
 _retry_read = _read_retry(_is_transient_error)
@@ -177,9 +229,7 @@ def _fetch_recent_mint_burns(asset_id: str, block: _BlockMetadata) -> list[dict]
 @_retry_read
 def _fetch_total_supply(asset_id: str) -> int:
     """Fetch the current total supply for an asset."""
-    api = _get_api()
-    asset = api.asset(asset_id)
-    return int(asset.quantity)
+    return int(_get_api().asset(asset_id).quantity)
 
 
 async def get_mints_for_block(block_hash: str) -> list[MintEvent]:
@@ -269,4 +319,4 @@ async def get_total_supply(asset_id: str) -> int:
 
 async def _run_read(function, *args):
     """Keep Blockfrost I/O and backoff off the executor used by X and other work."""
-    return await asyncio.get_running_loop().run_in_executor(_executor, copy_context().run, partial(function, *args))
+    return await asyncio.get_running_loop().run_in_executor(_get_executor(), copy_context().run, function, *args)

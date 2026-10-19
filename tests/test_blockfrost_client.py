@@ -1,7 +1,7 @@
 """Tests for the Blockfrost client cross-referencing logic."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from http.client import RemoteDisconnected
 from threading import Event, Lock
@@ -10,12 +10,22 @@ from unittest.mock import Mock
 
 import pytest
 from blockfrost import ApiError
-from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
-from tenacity import RetryError, wait_none
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, SSLError, Timeout
+from tenacity import RetryError, Retrying, wait_none
 
 import bot.blockfrost_client as bf_client
 from bot.config import NEW_STABLECOINS_ACTIVATED_AT, USDA, USDCX, USDM, Stablecoin
 from bot.models import MintEvent
+
+
+def _retried_reads():
+    """Every module-level read and the tenacity policy it owns, looking through lru_cache."""
+    for name in sorted(vars(bf_client)):
+        member = getattr(bf_client, name)
+        for candidate in (member, getattr(member, "__wrapped__", None)):
+            if isinstance(getattr(candidate, "retry", None), Retrying):
+                yield name, candidate.retry
+                break
 
 
 @pytest.fixture(autouse=True)
@@ -23,9 +33,9 @@ def default_to_usdm(monkeypatch):
     """Keep existing single-token fixtures scoped to USDM."""
     monkeypatch.setattr(bf_client, "STABLECOINS", (USDM,))
     bf_client._fetch_transaction_block_height.cache_clear()
-    # Each shared policy covers all reads using it.
-    monkeypatch.setattr(bf_client._fetch_block_transactions_page.retry, "wait", wait_none())
-    monkeypatch.setattr(bf_client._fetch_history_page.retry, "wait", wait_none())
+    # Each read owns its policy, so silence all of them rather than one shared instance.
+    for _, policy in _retried_reads():
+        monkeypatch.setattr(policy, "wait", wait_none())
 
 
 @pytest.mark.asyncio
@@ -382,6 +392,26 @@ def test_blockfrost_reads_do_not_retry_permanent_errors(
 
 
 @pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+@pytest.mark.parametrize(
+    "error",
+    [SSLError("certificate verify failed"), ProxyError("407 Proxy Authentication Required")],
+    ids=["tls", "proxy"],
+)
+def test_blockfrost_reads_do_not_retry_local_transport_misconfiguration(
+    monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, error
+):
+    """A broken CA bundle or proxy is not transient; it must surface at once, not after the budget."""
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(type(error)) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert failure.value is error
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
 def test_only_block_related_reads_retry_indexing_404(
     monkeypatch, caplog, fetcher, method, args, response, expected, attempts, retry_404
 ):
@@ -438,18 +468,54 @@ def test_history_uses_full_retry_budget_before_dropping_events(monkeypatch):
     assert history.call_count == 5
 
 
-def test_retry_policies_use_bounded_jitter(monkeypatch):
-    # New policy instance avoids this module's no-wait fixture.
-    policy = bf_client._read_retry(bf_client._is_transient_error)(lambda: None).retry
-    state = SimpleNamespace(attempt_number=1)
+def _failed(error):
+    outcome = Future()
+    outcome.set_exception(error)
+    return outcome
+
+
+def test_each_read_owns_its_retry_policy():
+    policies = dict(_retried_reads())
+
+    assert set(policies) == {
+        "_fetch_block_metadata",
+        "_fetch_block_transactions_page",
+        "_fetch_history_page",
+        "_fetch_total_supply",
+        "_fetch_transaction_block_height",
+    }
+    assert len({id(policy) for policy in policies.values()}) == len(policies)
+    # The autouse fixture must have reached every one of them, not a single shared instance.
+    assert all(isinstance(policy.wait, wait_none) for policy in policies.values())
+
+
+@pytest.mark.parametrize(
+    "error", [api_error(503), api_error(429), ConnectionError("reset")], ids=["503", "429", "reset"]
+)
+def test_contention_waits_use_full_jitter(monkeypatch, error):
     uniform = Mock(side_effect=lambda low, high: high)
     monkeypatch.setattr("tenacity.wait.random.uniform", uniform)
+    state = SimpleNamespace(attempt_number=1, outcome=_failed(error))
 
-    assert policy.wait(state) == 2
+    assert bf_client._wait_for_read(state) == 2
     uniform.assert_called_once_with(1, 2)
     state.attempt_number = 4
-    assert policy.wait(state) == 8
+    assert bf_client._wait_for_read(state) == 8
     assert uniform.call_args.args == (1, 8)
+
+
+def test_indexing_waits_keep_a_floor_jitter_cannot_shorten(monkeypatch):
+    """A block Blockfrost has not indexed yet always gets 16 seconds before the final attempt."""
+    spread = Mock(return_value=0.0)
+    monkeypatch.setattr("tenacity.wait.random.random", spread)
+    outcome = _failed(api_error(404))
+
+    waits = [bf_client._wait_for_read(SimpleNamespace(attempt_number=n, outcome=outcome)) for n in range(1, 5)]
+
+    assert waits == [2, 2, 4, 8]
+    assert spread.call_count == 4
+    spread.return_value = 1.0
+    assert bf_client._wait_for_read(SimpleNamespace(attempt_number=1, outcome=outcome)) == 3
 
 
 @pytest.mark.asyncio
@@ -487,6 +553,37 @@ async def test_dedicated_executor_preserves_request_context():
         assert await bf_client._run_read(trace.get) == "request-trace"
     finally:
         trace.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drops_queued_reads_and_later_reads_get_a_fresh_pool(monkeypatch):
+    started = Event()
+    release = Event()
+
+    def occupy_worker():
+        started.set()
+        release.wait(timeout=2)
+        return "finished"
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(bf_client, "_executor", pool)
+    active = asyncio.create_task(bf_client._run_read(occupy_worker))
+    queued = asyncio.create_task(bf_client._run_read(lambda: "never runs"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+
+        bf_client.shutdown_reads()
+
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        release.set()
+        assert await active == "finished"
+        assert bf_client._executor is None
+        assert await bf_client._run_read(lambda: "fresh pool") == "fresh pool"
+        assert bf_client._executor is not pool
+    finally:
+        release.set()
+        bf_client.shutdown_reads()
 
 
 @pytest.mark.parametrize("error", [api_error(502), Timeout("read timed out"), ConnectionError("connection reset")])
