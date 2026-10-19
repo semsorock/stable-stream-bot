@@ -1,12 +1,13 @@
 """Blockfrost API client for querying stablecoin mint/burn events."""
 
 import asyncio
+import logging
 from functools import lru_cache
 from threading import Lock
 
 from blockfrost import ApiError, BlockFrostApi
 from requests.exceptions import ConnectionError, Timeout
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .config import STABLECOINS, Stablecoin, get_config
 from .logging import get_logger
@@ -15,18 +16,16 @@ from .models import MintEvent
 logger = get_logger(__name__)
 
 
-def _is_rate_limited(exc: BaseException) -> bool:
-    return isinstance(exc, ApiError) and exc.status_code == 429
-
-
-def _is_rate_limited_or_not_found(exc: BaseException) -> bool:
-    return isinstance(exc, ApiError) and exc.status_code in (404, 429)
-
-
-def _is_transient_metadata_error(exc: BaseException) -> bool:
+def _is_transient_error(exc: BaseException) -> bool:
+    """Retry safe reads on transport failures, rate limits, and server errors."""
     return isinstance(exc, (ConnectionError, Timeout)) or (
-        isinstance(exc, ApiError) and (exc.status_code in (404, 429) or 500 <= exc.status_code < 600)
+        isinstance(exc, ApiError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
     )
+
+
+def _is_transient_or_not_found(exc: BaseException) -> bool:
+    """Block-related reads also tolerate delayed Blockfrost indexing."""
+    return _is_transient_error(exc) or (isinstance(exc, ApiError) and exc.status_code == 404)
 
 
 @lru_cache(maxsize=1)
@@ -38,7 +37,8 @@ def _get_api() -> BlockFrostApi:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_rate_limited_or_not_found),
+    retry=retry_if_exception(_is_transient_or_not_found),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
     """Fetch all transaction hashes for a given block."""
@@ -59,7 +59,8 @@ def _fetch_block_tx_hashes(block_hash: str) -> set[str]:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_transient_metadata_error),
+    retry=retry_if_exception(_is_transient_or_not_found),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 def _fetch_block_metadata(block_hash: str):
     """Read authoritative time and height, retrying transient Blockfrost failures."""
@@ -102,7 +103,8 @@ class _BlockMetadata:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception(_is_transient_metadata_error),
+    retry=retry_if_exception(_is_transient_or_not_found),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 def _fetch_transaction_block_height(tx_hash: str) -> int:
     """Cache page-boundary transaction heights so quiet histories need no repeated lookup."""
@@ -112,7 +114,12 @@ def _fetch_transaction_block_height(tx_hash: str) -> int:
     return height
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=1, max=10),
+    retry=retry_if_exception(_is_transient_error),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 def _fetch_history_page(asset_id: str, page: int):
     return _get_api().asset_history(asset_id, order="desc", count=100, page=page)
 
@@ -154,7 +161,12 @@ def _fetch_recent_mint_burns(asset_id: str, block: _BlockMetadata) -> list[dict]
     return events
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception(_is_rate_limited))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=1, max=10),
+    retry=retry_if_exception(_is_transient_error),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 def _fetch_total_supply(asset_id: str) -> int:
     """Fetch the current total supply for an asset."""
     api = _get_api()

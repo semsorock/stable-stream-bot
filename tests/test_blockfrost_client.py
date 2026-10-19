@@ -1,6 +1,7 @@
 """Tests for the Blockfrost client cross-referencing logic."""
 
 import asyncio
+from http.client import RemoteDisconnected
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -19,9 +20,11 @@ def default_to_usdm(monkeypatch):
     """Keep existing single-token fixtures scoped to USDM."""
     monkeypatch.setattr(bf_client, "STABLECOINS", (USDM,))
     bf_client._fetch_transaction_block_height.cache_clear()
+    monkeypatch.setattr(bf_client._fetch_block_tx_hashes.retry, "wait", wait_none())
     monkeypatch.setattr(bf_client._fetch_block_metadata.retry, "wait", wait_none())
     monkeypatch.setattr(bf_client._fetch_history_page.retry, "wait", wait_none())
     monkeypatch.setattr(bf_client._fetch_transaction_block_height.__wrapped__.retry, "wait", wait_none())
+    monkeypatch.setattr(bf_client._fetch_total_supply.retry, "wait", wait_none())
 
 
 @pytest.mark.asyncio
@@ -285,6 +288,118 @@ def api_error(status):
     return ApiError(
         SimpleNamespace(status_code=status, json=lambda: {"status_code": status, "error": "", "message": ""})
     )
+
+
+_READ_CASES = [
+    pytest.param("_fetch_history_page", "asset_history", ("asset", 2), [], [], 3, id="history-page"),
+    pytest.param("_fetch_total_supply", "asset", ("asset",), SimpleNamespace(quantity="123"), 123, 3, id="supply"),
+    pytest.param("_fetch_block_tx_hashes", "block_transactions", ("block",), ["tx"], {"tx"}, 5, id="block-txs"),
+    pytest.param(
+        "_fetch_block_metadata",
+        "block",
+        ("block",),
+        SimpleNamespace(height=1),
+        SimpleNamespace(height=1),
+        5,
+        id="block-metadata",
+    ),
+    pytest.param(
+        "_fetch_transaction_block_height",
+        "transaction",
+        ("tx",),
+        SimpleNamespace(block_height=1),
+        1,
+        5,
+        id="boundary-height",
+    ),
+]
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts", _READ_CASES)
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("Connection aborted.", RemoteDisconnected("Remote end closed connection without response")),
+        Timeout("read timed out"),
+        api_error(429),
+        api_error(500),
+        api_error(502),
+        api_error(503),
+    ],
+    ids=["remote-disconnected", "timeout", "429", "500", "502", "503"],
+)
+def test_blockfrost_reads_retry_transient_failures(
+    monkeypatch, caplog, fetcher, method, args, response, expected, attempts, error
+):
+    request = Mock(side_effect=[error, response])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    assert getattr(bf_client, fetcher)(*args) == expected
+
+    assert request.call_count == 2
+    assert "Retrying" in caplog.text
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
+    assert request.call_args_list[0] == request.call_args_list[1]
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts", _READ_CASES)
+@pytest.mark.parametrize("error", [ConnectionError("closed"), Timeout("timed out"), api_error(502)])
+def test_blockfrost_read_retries_are_bounded(monkeypatch, fetcher, method, args, response, expected, attempts, error):
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(RetryError) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert request.call_count == attempts
+    assert failure.value.last_attempt.exception() is error
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts", _READ_CASES)
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_blockfrost_reads_do_not_retry_permanent_errors(
+    monkeypatch, fetcher, method, args, response, expected, attempts, status
+):
+    error = api_error(status)
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(ApiError) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert failure.value is error
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts", _READ_CASES)
+def test_only_block_related_reads_retry_indexing_404(monkeypatch, fetcher, method, args, response, expected, attempts):
+    request = Mock(side_effect=[api_error(404), response])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    if method in ("block_transactions", "block", "transaction"):
+        assert getattr(bf_client, fetcher)(*args) == expected
+        assert request.call_count == 2
+    else:
+        with pytest.raises(ApiError):
+            getattr(bf_client, fetcher)(*args)
+        request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_disconnect_recovery_retains_usdm_event(monkeypatch, caplog):
+    """Reproduce the deployed first-page disconnect without dropping the block's event."""
+    history = Mock(
+        side_effect=[
+            ConnectionError("Connection aborted.", RemoteDisconnected("Remote end closed connection without response")),
+            [SimpleNamespace(tx_hash="usdm-mint", action="minted", amount="1000000")],
+        ]
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(asset_history=history))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"usdm-mint"})
+
+    assert await bf_client.get_mints_for_block("affected-block") == [MintEvent("usdm-mint", "minted", 1_000_000, USDM)]
+    assert history.call_count == 2
+    assert "Cannot read USDM history" not in caplog.text
 
 
 @pytest.mark.parametrize("error", [api_error(502), Timeout("read timed out"), ConnectionError("connection reset")])

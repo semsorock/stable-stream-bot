@@ -114,7 +114,7 @@ The bot generates links to Cardano Explorer via `bot/links.py`:
 
 ### Error Handling & Resilience
 
-- Uses `tenacity` with exponential backoff: five attempts for block transaction lookup on Blockfrost 404/429 responses, and three attempts for other rate-limited calls. Block metadata and history-boundary transaction lookups make five attempts for 404/429, transient 5xx, timeouts, and connection errors.
+- All Blockfrost reads retry connection errors, timeouts, 429, and 5xx using `tenacity` with exponential backoff. History pages and supply reads make at most three attempts; block transactions, metadata, and history-boundary lookups make at most five and also retry indexing-related 404 responses. Other 4xx errors are not retried. Each retry logs a warning; only reads are retried, never X post creation or whole blocks.
 
 - Metadata (timestamp and height) is shared within each block request. Activation-gated tokens verify time before history lookup, avoiding lifetime scans on old replays. A bounded cache of boundary transaction heights avoids repeat calls for quiet tokens. Later-page or boundary failures retain collected history and explicitly log that history is incomplete; initial history failures and individual event failures leave other tokens/events processing. Cancellation propagates.
 

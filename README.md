@@ -61,6 +61,12 @@ Pre-activation tokens are skipped before history lookup. If a later page or
 boundary lookup fails, collected events are retained and incomplete history is
 logged. Activation and amount filters run together before supply lookup.
 
+All Blockfrost reads retry connection failures, timeouts, 429, and 5xx with
+exponential backoff: up to three attempts for history pages/supply and five for
+block-related reads (which also retry indexing-related 404s). Retries log warnings;
+persistent failures retain the failure-isolation behavior above. Whole blocks and
+X posts are not automatically replayed.
+
 ### Post Images
 
 Each post attaches one bundled **1200 × 400 PNG**, selected by token and action:
