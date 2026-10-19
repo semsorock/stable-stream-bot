@@ -61,6 +61,20 @@ Pre-activation tokens are skipped before history lookup. If a later page or
 boundary lookup fails, collected events are retained and incomplete history is
 logged. Activation and amount filters run together before supply lookup.
 
+All Blockfrost reads share one keep-alive HTTP session with a 3.05-second connect
+timeout and 10-second read-idle timeout. Connection failures, truncated
+responses, timeouts, 429, and 5xx retry up to five attempts with fully jittered
+exponential backoff (1–8 seconds per wait). Block-related reads also retry
+indexing-related 404s at INFO on a fixed 2, 2, 4, 8-second schedule plus up to
+one second of jitter, so a block Blockfrost has not indexed yet always gets at
+least 16 seconds before the final attempt; other retries log WARNING. TLS and
+proxy errors indicate local misconfiguration and fail immediately. Both block
+transactions and histories retry only the failing page. An eight-worker
+Blockfrost executor keeps I/O and backoff off the shared executor used for X
+posting, and application shutdown cancels reads still queued on it. Persistent
+failures retain the failure-isolation behavior above. Whole blocks and X posts
+are not automatically replayed.
+
 ### Post Images
 
 Each post attaches one bundled **1200 × 400 PNG**, selected by token and action:

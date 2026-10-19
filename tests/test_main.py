@@ -237,3 +237,15 @@ async def test_supply_cancellation_propagates(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         await main_module._process_block("cancelled-block")
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_drops_queued_blockfrost_reads(monkeypatch):
+    """Queued reads belong to blocks that will not be posted once the process is gone."""
+    shutdown = Mock()
+    monkeypatch.setattr(main_module, "shutdown_reads", shutdown)
+
+    async with main_module.app.router.lifespan_context(main_module.app):
+        shutdown.assert_not_called()
+
+    shutdown.assert_called_once_with()

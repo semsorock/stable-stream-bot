@@ -1,17 +1,31 @@
 """Tests for the Blockfrost client cross-referencing logic."""
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import ContextVar
+from http.client import RemoteDisconnected
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from blockfrost import ApiError
-from requests.exceptions import ConnectionError, Timeout
-from tenacity import RetryError, wait_none
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, SSLError, Timeout
+from tenacity import RetryError, Retrying, wait_none
 
 import bot.blockfrost_client as bf_client
 from bot.config import NEW_STABLECOINS_ACTIVATED_AT, USDA, USDCX, USDM, Stablecoin
 from bot.models import MintEvent
+
+
+def _retried_reads():
+    """Every module-level read and the tenacity policy it owns, looking through lru_cache."""
+    for name in sorted(vars(bf_client)):
+        member = getattr(bf_client, name)
+        for candidate in (member, getattr(member, "__wrapped__", None)):
+            if isinstance(getattr(candidate, "retry", None), Retrying):
+                yield name, candidate.retry
+                break
 
 
 @pytest.fixture(autouse=True)
@@ -19,9 +33,9 @@ def default_to_usdm(monkeypatch):
     """Keep existing single-token fixtures scoped to USDM."""
     monkeypatch.setattr(bf_client, "STABLECOINS", (USDM,))
     bf_client._fetch_transaction_block_height.cache_clear()
-    monkeypatch.setattr(bf_client._fetch_block_metadata.retry, "wait", wait_none())
-    monkeypatch.setattr(bf_client._fetch_history_page.retry, "wait", wait_none())
-    monkeypatch.setattr(bf_client._fetch_transaction_block_height.__wrapped__.retry, "wait", wait_none())
+    # Each read owns its policy, so silence all of them rather than one shared instance.
+    for _, policy in _retried_reads():
+        monkeypatch.setattr(policy, "wait", wait_none())
 
 
 @pytest.mark.asyncio
@@ -287,6 +301,291 @@ def api_error(status):
     )
 
 
+_READ_CASES = [
+    pytest.param("_fetch_history_page", "asset_history", ("asset", 2), [], [], 5, False, id="history-page"),
+    pytest.param(
+        "_fetch_total_supply", "asset", ("asset",), SimpleNamespace(quantity="123"), 123, 5, False, id="supply"
+    ),
+    pytest.param("_fetch_block_tx_hashes", "block_transactions", ("block",), ["tx"], {"tx"}, 5, True, id="block-txs"),
+    pytest.param(
+        "_fetch_block_metadata",
+        "block",
+        ("block",),
+        SimpleNamespace(height=1),
+        SimpleNamespace(height=1),
+        5,
+        True,
+        id="block-metadata",
+    ),
+    pytest.param(
+        "_fetch_transaction_block_height",
+        "transaction",
+        ("tx",),
+        SimpleNamespace(block_height=1),
+        1,
+        5,
+        True,
+        id="boundary-height",
+    ),
+]
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("Connection aborted.", RemoteDisconnected("Remote end closed connection without response")),
+        ChunkedEncodingError("Response ended prematurely"),
+        Timeout("read timed out"),
+        api_error(429),
+        api_error(500),
+        api_error(502),
+        api_error(503),
+    ],
+    ids=["remote-disconnected", "mid-body-disconnect", "timeout", "429", "500", "502", "503"],
+)
+def test_blockfrost_reads_retry_transient_failures(
+    monkeypatch, caplog, fetcher, method, args, response, expected, attempts, retry_404, error
+):
+    request = Mock(side_effect=[error, response])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    assert getattr(bf_client, fetcher)(*args) == expected
+
+    assert request.call_count == 2
+    assert "Retrying" in caplog.text
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
+    assert request.call_args_list[0] == request.call_args_list[1]
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+@pytest.mark.parametrize(
+    "error", [ConnectionError("closed"), ChunkedEncodingError("truncated"), Timeout("timed out"), api_error(502)]
+)
+def test_blockfrost_read_retries_are_bounded(
+    monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, error
+):
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(RetryError) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert request.call_count == attempts
+    assert failure.value.last_attempt.exception() is error
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_blockfrost_reads_do_not_retry_permanent_errors(
+    monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, status
+):
+    error = api_error(status)
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(ApiError) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert failure.value is error
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+@pytest.mark.parametrize(
+    "error",
+    [SSLError("certificate verify failed"), ProxyError("407 Proxy Authentication Required")],
+    ids=["tls", "proxy"],
+)
+def test_blockfrost_reads_do_not_retry_local_transport_misconfiguration(
+    monkeypatch, fetcher, method, args, response, expected, attempts, retry_404, error
+):
+    """A broken CA bundle or proxy is not transient; it must surface at once, not after the budget."""
+    request = Mock(side_effect=error)
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    with pytest.raises(type(error)) as failure:
+        getattr(bf_client, fetcher)(*args)
+
+    assert failure.value is error
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("fetcher,method,args,response,expected,attempts,retry_404", _READ_CASES)
+def test_only_block_related_reads_retry_indexing_404(
+    monkeypatch, caplog, fetcher, method, args, response, expected, attempts, retry_404
+):
+    caplog.set_level("INFO", logger="bot.blockfrost_client")
+    request = Mock(side_effect=[api_error(404), response])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(**{method: request}))
+
+    if retry_404:
+        assert getattr(bf_client, fetcher)(*args) == expected
+        assert request.call_count == 2
+        assert "Retrying" in caplog.text
+        assert all(record.levelname == "INFO" for record in caplog.records)
+    else:
+        with pytest.raises(ApiError):
+            getattr(bf_client, fetcher)(*args)
+        request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_disconnect_recovery_retains_usdm_event(monkeypatch, caplog):
+    """Reproduce the deployed first-page disconnect without dropping the block's event."""
+    history = Mock(
+        side_effect=[
+            ConnectionError("Connection aborted.", RemoteDisconnected("Remote end closed connection without response")),
+            [SimpleNamespace(tx_hash="usdm-mint", action="minted", amount="1000000")],
+        ]
+    )
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(asset_history=history))
+    monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"usdm-mint"})
+
+    assert await bf_client.get_mints_for_block("affected-block") == [MintEvent("usdm-mint", "minted", 1_000_000, USDM)]
+    assert history.call_count == 2
+    assert "Cannot read USDM history" not in caplog.text
+
+
+def test_block_transaction_retry_does_not_refetch_completed_pages(monkeypatch):
+    page_one = [f"tx-{i}" for i in range(100)]
+    pages = Mock(side_effect=[page_one, api_error(503), ["last"]])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(block_transactions=pages))
+
+    assert bf_client._fetch_block_tx_hashes("busy-block") == {*page_one, "last"}
+
+    assert [call.kwargs["page"] for call in pages.call_args_list] == [1, 2, 2]
+
+
+def test_history_uses_full_retry_budget_before_dropping_events(monkeypatch):
+    entries = [SimpleNamespace(tx_hash="mint", action="minted", amount="1")]
+    history = Mock(side_effect=[*(api_error(503) for _ in range(4)), entries])
+    monkeypatch.setattr(bf_client, "_get_api", lambda: SimpleNamespace(asset_history=history))
+
+    assert bf_client._fetch_recent_mint_burns("asset", bf_client._BlockMetadata("block")) == [
+        {"tx_hash": "mint", "action": "minted", "amount": 1}
+    ]
+    assert history.call_count == 5
+
+
+def _failed(error):
+    outcome = Future()
+    outcome.set_exception(error)
+    return outcome
+
+
+def test_each_read_owns_its_retry_policy():
+    policies = dict(_retried_reads())
+
+    assert set(policies) == {
+        "_fetch_block_metadata",
+        "_fetch_block_transactions_page",
+        "_fetch_history_page",
+        "_fetch_total_supply",
+        "_fetch_transaction_block_height",
+    }
+    assert len({id(policy) for policy in policies.values()}) == len(policies)
+    # The autouse fixture must have reached every one of them, not a single shared instance.
+    assert all(isinstance(policy.wait, wait_none) for policy in policies.values())
+
+
+@pytest.mark.parametrize(
+    "error", [api_error(503), api_error(429), ConnectionError("reset")], ids=["503", "429", "reset"]
+)
+def test_contention_waits_use_full_jitter(monkeypatch, error):
+    uniform = Mock(side_effect=lambda low, high: high)
+    monkeypatch.setattr("tenacity.wait.random.uniform", uniform)
+    state = SimpleNamespace(attempt_number=1, outcome=_failed(error))
+
+    assert bf_client._wait_for_read(state) == 2
+    uniform.assert_called_once_with(1, 2)
+    state.attempt_number = 4
+    assert bf_client._wait_for_read(state) == 8
+    assert uniform.call_args.args == (1, 8)
+
+
+def test_indexing_waits_keep_a_floor_jitter_cannot_shorten(monkeypatch):
+    """A block Blockfrost has not indexed yet always gets 16 seconds before the final attempt."""
+    spread = Mock(return_value=0.0)
+    monkeypatch.setattr("tenacity.wait.random.random", spread)
+    outcome = _failed(api_error(404))
+
+    waits = [bf_client._wait_for_read(SimpleNamespace(attempt_number=n, outcome=outcome)) for n in range(1, 5)]
+
+    assert waits == [2, 2, 4, 8]
+    assert spread.call_count == 4
+    spread.return_value = 1.0
+    assert bf_client._wait_for_read(SimpleNamespace(attempt_number=1, outcome=outcome)) == 3
+
+
+@pytest.mark.asyncio
+async def test_blockfrost_pool_is_bounded_and_leaves_default_executor_free(monkeypatch):
+    release = Event()
+    full = Event()
+    lock = Lock()
+    started = 0
+
+    def blocked():
+        nonlocal started
+        with lock:
+            started += 1
+            if started == 2:
+                full.set()
+        release.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setattr(bf_client, "_executor", pool)
+        tasks = [asyncio.create_task(bf_client._run_read(blocked)) for _ in range(4)]
+        try:
+            assert await asyncio.to_thread(full.wait, 1)
+            assert started == 2
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: "free"), timeout=1) == "free"
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_executor_preserves_request_context():
+    trace = ContextVar("trace", default="missing")
+    token = trace.set("request-trace")
+    try:
+        assert await bf_client._run_read(trace.get) == "request-trace"
+    finally:
+        trace.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drops_queued_reads_and_later_reads_get_a_fresh_pool(monkeypatch):
+    started = Event()
+    release = Event()
+
+    def occupy_worker():
+        started.set()
+        release.wait(timeout=2)
+        return "finished"
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(bf_client, "_executor", pool)
+    active = asyncio.create_task(bf_client._run_read(occupy_worker))
+    queued = asyncio.create_task(bf_client._run_read(lambda: "never runs"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+
+        bf_client.shutdown_reads()
+
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        release.set()
+        assert await active == "finished"
+        assert bf_client._executor is None
+        assert await bf_client._run_read(lambda: "fresh pool") == "fresh pool"
+        assert bf_client._executor is not pool
+    finally:
+        release.set()
+        bf_client.shutdown_reads()
+
+
 @pytest.mark.parametrize("error", [api_error(502), Timeout("read timed out"), ConnectionError("connection reset")])
 @pytest.mark.asyncio
 async def test_transient_block_metadata_failure_recovers(monkeypatch, error):
@@ -545,7 +844,7 @@ async def test_incomplete_history_preserves_known_usdm_events(monkeypatch, caplo
     elif failure == "boundary-transaction":
         transaction.side_effect = Timeout("boundary transaction unavailable")
     else:
-        history.side_effect = [history.return_value, *(api_error(429) for _ in range(3))]
+        history.side_effect = [history.return_value, *(api_error(429) for _ in range(5))]
     api = SimpleNamespace(asset_history=history, block=block, transaction=transaction)
     monkeypatch.setattr(bf_client, "_get_api", lambda: api)
     monkeypatch.setattr(bf_client, "_fetch_block_tx_hashes", lambda _: {"known-usdm"})
@@ -553,7 +852,7 @@ async def test_incomplete_history_preserves_known_usdm_events(monkeypatch, caplo
     assert await bf_client.get_mints_for_block("partially-readable") == [MintEvent("known-usdm", "minted", 1, USDM)]
     assert "history incomplete" in caplog.text
     assert "retaining 100 collected events" in caplog.text
-    assert history.call_count == (4 if failure == "later-history-page" else 1)
+    assert history.call_count == (6 if failure == "later-history-page" else 1)
 
 
 @pytest.mark.asyncio
