@@ -3,16 +3,18 @@
 import ast
 import inspect
 import json
+import socket
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import BaseRequestHandler
 from threading import Event, Thread
 from unittest.mock import Mock
 
 import pytest
 from blockfrost import ApiError
 from requests import Response, Session
-from requests.exceptions import ChunkedEncodingError, ReadTimeout
-from tenacity import wait_none
+from requests.exceptions import ChunkedEncodingError, ReadTimeout, SSLError
+from tenacity import RetryError, wait_none
 
 import bot.blockfrost_client as client
 import bot.blockfrost_transport as transport
@@ -145,6 +147,36 @@ def test_reads_share_one_session_pooled_for_the_read_workers():
     for scheme in ("https://", "http://"):
         adapter = transport._session.get_adapter(f"{scheme}cardano-mainnet.blockfrost.io")
         assert adapter._pool_maxsize == transport.POOL_SIZE
+
+
+def test_real_tls_eof_uses_bounded_retries_without_disabling_verification(monkeypatch):
+    """A local peer accepts ClientHello then closes TLS, reproducing the production failure."""
+    connections = []
+
+    class TlsEof(BaseRequestHandler):
+        def handle(self):
+            connections.append(self.client_address)
+            self.request.settimeout(2)
+            self.request.recv(65536)
+            self.request.shutdown(socket.SHUT_WR)
+            # Drain until the client closes to avoid replacing FIN with a TCP reset.
+            while self.request.recv(65536):
+                pass
+
+    with transport._build_session() as session, _serve(TlsEof) as port:
+        session.trust_env = False  # Keep this local test independent of developer proxy/CA settings.
+        assert session.verify is True
+        monkeypatch.setattr(transport, "_session", session)
+        api = transport.TimeoutBlockFrostApi(project_id="mainnetTEST", base_url=f"https://127.0.0.1:{port}")
+        monkeypatch.setattr(client, "_get_api", lambda: api)
+        monkeypatch.setattr(client._fetch_history_page.retry, "wait", wait_none())
+
+        with pytest.raises(RetryError) as failure:
+            client._fetch_history_page("asset", 1)
+
+        assert isinstance(failure.value.last_attempt.exception(), SSLError)
+        assert len(connections) == 5
+        assert session.verify is True
 
 
 def test_sequential_reads_reuse_one_connection():

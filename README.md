@@ -67,8 +67,9 @@ responses, timeouts, 429, and 5xx retry up to five attempts with fully jittered
 exponential backoff (1–8 seconds per wait). Block-related reads also retry
 indexing-related 404s at INFO on a fixed 2, 2, 4, 8-second schedule plus up to
 one second of jitter, so a block Blockfrost has not indexed yet always gets at
-least 16 seconds before the final attempt; other retries log WARNING. TLS and
-proxy errors indicate local misconfiguration and fail immediately. Both block
+least 16 seconds before the final attempt; other retries log WARNING. Unexpected
+TLS EOFs retry within the same five-attempt budget. Certificate-verification,
+other TLS, and proxy errors fail immediately; TLS verification stays enabled. Both block
 transactions and histories retry only the failing page. An eight-worker
 Blockfrost executor keeps I/O and backoff off the shared executor used for X
 posting, and application shutdown cancels reads still queued on it. Persistent
